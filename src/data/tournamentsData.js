@@ -1,0 +1,103 @@
+export const TOURNAMENTS_LIST = [
+  {
+    id: "TRN-101",
+    title: "FF HUB Pro Solo Clash #42",
+    mode: "Solo • Battle Royale",
+    map: "Bermuda",
+    prizePool: "৳ 2,500 + 1000 💎",
+    entryFee: "Free Entry",
+    perKillPrize: "৳ 15 / Kill",
+    schedule: "Today, 09:00 PM",
+    totalSlots: 48,
+    filledSlots: 41,
+    status: "Registration Open",
+    badge: "FREE ENTRY",
+    roomDetails: "Room ID & Password will be shared 15 mins before match.",
+  },
+  {
+    id: "TRN-102",
+    title: "Squad Rush Championship BD",
+    mode: "Squad (4v4) • Clash Squad",
+    map: "Kalahari / Bermuda",
+    prizePool: "৳ 5,000 Cash",
+    entryFee: "৳ 80 / Squad",
+    perKillPrize: "Win Takes All",
+    schedule: "Tomorrow, 08:30 PM",
+    totalSlots: 16,
+    filledSlots: 12,
+    status: "Registration Open",
+    badge: "HOT TOURNAMENT",
+    roomDetails: "Custom Room settings: Unlimited Ammo Yes, Character Skill No.",
+  },
+  {
+    id: "TRN-103",
+    title: "Friday Night Duo Survival",
+    mode: "Duo • Battle Royale",
+    map: "Purgatory",
+    prizePool: "2,480 Diamonds 💎",
+    entryFee: "Free (VIP Members)",
+    perKillPrize: "20 💎 / Kill",
+    schedule: "Friday, 10:00 PM",
+    totalSlots: 48,
+    filledSlots: 48,
+    status: "Slots Full",
+    badge: "FULL",
+    roomDetails: "All 48 slots booked. Watch live stream on our official page.",
+  },
+];
+
+export const GIVEAWAYS_LIST = [
+  {
+    id: "GVW-01",
+    title: "5x Weekly Membership Giveaway",
+    reward: "450 Diamonds (Weekly Pass)",
+    winnersCount: "5 Lucky Winners",
+    endsIn: "14 Hours 30 Mins",
+    participants: 1240,
+    requirement: "Enter your Free Fire UID & Share with 1 friend",
+    badge: "ACTIVE GIVEAWAY",
+  },
+  {
+    id: "GVW-02",
+    title: "1240 Diamonds Mega Drop",
+    reward: "1240 Diamonds Instant UID Top-Up",
+    winnersCount: "2 Lucky Winners",
+    endsIn: "3 Days",
+    participants: 2890,
+    requirement: "Must have at least 1 completed order this month",
+    badge: "MEGA PRIZE",
+  },
+];
+
+export const SPIN_WHEEL_REWARDS = [
+  { id: 1, label: "5 Bonus Coins", points: 5, type: "coins", probability: "High" },
+  { id: 2, label: "৳10 Discount Code", code: "FFHUB10", type: "voucher", probability: "Medium" },
+  { id: 3, label: "15 Bonus Coins", points: 15, type: "coins", probability: "Medium" },
+  { id: 4, label: "Better Luck Tomorrow", points: 2, type: "consolation", probability: "High" },
+  { id: 5, label: "25 Diamonds Jackpot!", points: 250, type: "jackpot", probability: "Rare" },
+  { id: 6, label: "10 Bonus Coins", points: 10, type: "coins", probability: "High" },
+];
+
+export const DAILY_QUIZ_QUESTIONS = [
+  {
+    id: "Q1",
+    question: "Free Fire-এ নিচের কোন ক্যারেক্টারটির অ্যাবিলিটির নাম 'Drop the Beat'?",
+    options: ["Chrono", "DJ Alok", "K (Captain Booyah)", "Skyler"],
+    correctAnswer: "DJ Alok",
+    rewardPoints: 10,
+  },
+  {
+    id: "Q2",
+    question: "Free Fire-এর ক্লাসিক ম্যাপ 'Bermuda'-তে নিচের কোন জায়গাটি রয়েছে?",
+    options: ["Pochinki", "Clock Tower", "Tilted Towers", "firing Range"],
+    correctAnswer: "Clock Tower",
+    rewardPoints: 10,
+  },
+  {
+    id: "Q3",
+    question: "কোন ইভো গানটির (Evo Gun) নাম 'Blue Flame Draco'?",
+    options: ["MP40", "AK47", "M1014", "SCAR"],
+    correctAnswer: "AK47",
+    rewardPoints: 10,
+  },
+];
