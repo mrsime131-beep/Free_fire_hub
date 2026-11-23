@@ -1,0 +1,17 @@
+{
+  "name": "FREE FIRE HUB - Diamond Top-Up Platform",
+  "short_name": "FF HUB",
+  "description": "Bangladesh's Most Trusted & Fastest Free Fire Diamond Top-Up Platform",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#080B14",
+  "theme_color": "#2563EB",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/favicon.ico",
+      "sizes": "64x64 32x32 24x24 16x16",
+      "type": "image/x-icon"
+    }
+  ]
+}
