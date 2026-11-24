@@ -1,87 +1,230 @@
-import { prisma } from "../config/db.js";
-import { logger } from "../utils/logger.js";
+const prisma = require('../config/prisma');
+const { getClientIp } = require('../middlewares/rateLimiter.middleware');
 
 /**
- * Express Request (req) থেকে ক্লায়েন্টের আসল IP Address বের করার ফাংশন
- * Render এবং Cloudflare প্রক্সি হেডার (x-forwarded-for) সমর্থন করে
+ * JSON ফিল্ডে সেভ করার আগে সংবেদনশীল কী (যেমন password, token, secret) মুছে ফেলা
+ * এবং Decimal/Date নিরাপদে সিরিয়ালাইজ করার হেল্পার ফাংশন।
  */
-export function extractClientIp(req) {
-  if (!req) return null;
+const sanitizeAuditPayload = (data) => {
+  if (!data || typeof data !== 'object') return data || null;
 
-  const forwardedFor = req.headers?.["x-forwarded-for"];
-  if (forwardedFor) {
-    const ips = String(forwardedFor).split(",");
-    return ips[0].trim();
-  }
-
-  return (
-    req.headers?.["x-real-ip"] ||
-    req.ip ||
-    req.socket?.remoteAddress ||
-    null
-  );
-}
-
-/**
- * Express Request (req) থেকে User-Agent বের করার ফাংশন
- */
-export function extractUserAgent(req) {
-  if (!req || !req.headers) return null;
-  const ua = req.headers["user-agent"] || req.headers["User-Agent"];
-  return ua ? String(ua).slice(0, 500) : null;
-}
-
-/**
- * ডাটাবেসের AuditLog টেবিলে সিকিউরিটি ও বিজনেস ইভেন্ট সংরক্ষণ করার মূল ফাংশন
- * এটি ব্যাকগ্রাউন্ডে নিরাপদভাবে লগ সেভ করবে এবং কোনো কারণে লগিং ব্যর্থ হলেও মূল অর্ডার বা পেমেন্ট প্রসেসকে ক্র্যাশ করাবে না।
- *
- * @param {object} params
- * @param {string|null} [params.userId] - ইউজার বা অ্যাডমিনের আইডি (Guest হলে null)
- * @param {string} params.action - কী অ্যাকশন নেওয়া হয়েছে (যেমন: ORDER_CREATED, PAYMENT_SUBMITTED, PAYMENT_VERIFIED, DELIVERY_TRIGGERED)
- * @param {string} params.entityType - কোন মডেলে পরিবর্তন হয়েছে (যেমন: ORDER, PAYMENT, PRODUCT, DELIVERY, USER)
- * @param {string|null} [params.entityId] - সংশ্লিষ্ট মডেলের আইডি বা অর্ডার নম্বর
- * @param {object|null} [params.req] - Express Request অবজেক্ট (IP ও User-Agent অটোমেটিক নেওয়ার জন্য)
- * @param {string|null} [params.ipAddress] - ম্যানুয়ালি IP পাস করতে চাইলে
- * @param {string|null} [params.userAgent] - ম্যানুয়ালি User-Agent পাস করতে চাইলে
- * @param {object|null} [params.metadata] - অতিরিক্ত তথ্য (JSON আকারে সেভ হবে)
- */
-export async function logAuditEvent({
-  userId = null,
-  action,
-  entityType,
-  entityId = null,
-  req = null,
-  ipAddress = null,
-  userAgent = null,
-  metadata = null,
-}) {
   try {
-    const resolvedUserId = userId || req?.user?.id || null;
-    const resolvedIp = ipAddress || extractClientIp(req);
-    const resolvedUserAgent = userAgent || extractUserAgent(req);
+    const rawClone = JSON.parse(JSON.stringify(data));
+    const redactKeys = [
+      'password',
+      'passwordHash',
+      'token',
+      'jwt',
+      'secret',
+      'apiKey',
+      'apiSecret',
+      'pin',
+      'otp',
+    ];
 
-    const record = await prisma.auditLog.create({
+    const cleanObject = (obj) => {
+      if (Array.isArray(obj)) {
+        return obj.map(cleanObject);
+      }
+      if (obj && typeof obj === 'object') {
+        const result = {};
+        for (const [key, value] of Object.entries(obj)) {
+          if (redactKeys.some((r) => key.toLowerCase().includes(r.toLowerCase()))) {
+            result[key] = '[REDACTED]';
+          } else {
+            result[key] = cleanObject(value);
+          }
+        }
+        return result;
+      }
+      return obj;
+    };
+
+    return cleanObject(rawClone);
+  } catch (error) {
+    return { note: 'Unserializable payload omitted' };
+  }
+};
+
+/**
+ * ১. ডাটাবেসে নতুন Audit Log সংরক্ষণ করার কোর ফাংশন
+ * এটি সাধারণ কল এবং Prisma $transaction (txClient)—উভয় ক্ষেত্রেই কাজ করবে।
+ */
+const createAuditLog = async (
+  {
+    actor = null,
+    actorId = null,
+    actorEmail = null,
+    actorRole = null,
+    action,
+    entityType = 'ORDER',
+    entityId,
+    orderId = null,
+    previousState = null,
+    newState = null,
+    req = null,
+    ipAddress = null,
+    userAgent = null,
+    metadata = null,
+  },
+  txClient = null
+) => {
+  const db = txClient || prisma;
+
+  try {
+    const resolvedActorId = actor?.id || actorId || req?.user?.id || null;
+    const resolvedActorEmail =
+      actor?.email || actorEmail || req?.user?.email || 'SYSTEM';
+    const resolvedActorRole =
+      actor?.role || actorRole || req?.user?.role || 'SYSTEM';
+
+    const resolvedIp =
+      ipAddress || (req ? getClientIp(req) : null) || '127.0.0.1';
+    const resolvedUserAgent =
+      userAgent ||
+      (req?.headers && req.headers['user-agent']
+        ? String(req.headers['user-agent']).slice(0, 300)
+        : null);
+
+    const auditEntry = await db.auditLog.create({
       data: {
-        userId: resolvedUserId,
+        actorId: resolvedActorId,
+        actorEmail: resolvedActorEmail,
+        actorRole: resolvedActorRole,
         action: String(action).toUpperCase(),
         entityType: String(entityType).toUpperCase(),
-        entityId: entityId ? String(entityId) : null,
+        entityId: String(entityId),
+        orderId: orderId || (entityType === 'ORDER' ? String(entityId) : null),
+        previousState: sanitizeAuditPayload(previousState),
+        newState: sanitizeAuditPayload(newState),
         ipAddress: resolvedIp,
         userAgent: resolvedUserAgent,
-        metadata: metadata || undefined,
+        metadata: sanitizeAuditPayload(metadata),
       },
     });
 
-    logger.debug(
-      `Audit event recorded: ${action} on ${entityType} (${entityId || "N/A"})`,
-      { auditId: record.id, userId: resolvedUserId, ip: resolvedIp },
-      "AUDIT"
-    );
-
-    return record;
+    return auditEntry;
   } catch (error) {
-    // অডিট লগ সেভ হতে কোনো সমস্যা হলে সার্ভারের কনসোলে সতর্কবার্তা দেখাবে, কিন্তু কাস্টমারের অর্ডার আটকে রাখবে না
-    logger.error("Failed to write audit log to database", error, "AUDIT_ERROR");
+    // অডিট লগ সেভ করতে কোনো অপ্রত্যাশিত সমস্যা হলে সার্ভার কনসোলে লগ রাখবে
+    console.error('⚠️ AuditLog creation warning:', error.message);
     return null;
   }
-}
+};
+
+/**
+ * ২. অ্যাডমিনের অর্ডার, পেমেন্ট ও ডেলিভারি অ্যাকশনের জন্য শর্টকাট হেল্পার ফাংশন
+ */
+const logAdminOrderAction = async (
+  {
+    adminUser,
+    action,
+    order,
+    previousState = null,
+    newState = null,
+    reason = null,
+    req = null,
+    extraMetadata = {},
+  },
+  txClient = null
+) => {
+  return createAuditLog(
+    {
+      actor: adminUser,
+      action,
+      entityType: 'ORDER',
+      entityId: order.id,
+      orderId: order.id,
+      previousState:
+        previousState || {
+          orderStatus: order.orderStatus,
+          paymentStatus: order.paymentStatus,
+          deliveryStatus: order.deliveryStatus,
+        },
+      newState,
+      req,
+      metadata: {
+        orderNumber: order.orderNumber,
+        playerUid: order.playerUid,
+        reason,
+        ...extraMetadata,
+      },
+    },
+    txClient
+  );
+};
+
+/**
+ * ৩. নির্দিষ্ট একটি অর্ডারের সম্পূর্ণ অডিট লগ ইতিহাস বের করার ফাংশন
+ */
+const getOrderAuditLogs = async (orderId) => {
+  if (!orderId) return [];
+
+  return prisma.auditLog.findMany({
+    where: {
+      OR: [{ orderId }, { entityId: orderId }],
+    },
+    orderBy: {
+      createdAt: 'desc',
+    },
+  });
+};
+
+/**
+ * ৪. অ্যাডমিন ড্যাশবোর্ডের জন্য ফিল্টার ও পেজিনেশনসহ সব অডিট লগ দেখার ফাংশন
+ */
+const getAdminAuditLogs = async ({
+  page = 1,
+  limit = 30,
+  action = null,
+  actorEmail = null,
+  orderId = null,
+} = {}) => {
+  const safePage = Math.max(1, Number(page) || 1);
+  const safeLimit = Math.min(100, Math.max(1, Number(limit) || 30));
+  const skip = (safePage - 1) * safeLimit;
+
+  const where = {};
+
+  if (action) {
+    where.action = String(action).trim().toUpperCase();
+  }
+
+  if (actorEmail) {
+    where.actorEmail = {
+      contains: String(actorEmail).trim(),
+      mode: 'insensitive',
+    };
+  }
+
+  if (orderId) {
+    where.orderId = String(orderId).trim();
+  }
+
+  const [logs, totalCount] = await Promise.all([
+    prisma.auditLog.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: safeLimit,
+    }),
+    prisma.auditLog.count({ where }),
+  ]);
+
+  return {
+    logs,
+    pagination: {
+      page: safePage,
+      limit: safeLimit,
+      totalCount,
+      totalPages: Math.ceil(totalCount / safeLimit) || 1,
+    },
+  };
+};
+
+module.exports = {
+  sanitizeAuditPayload,
+  createAuditLog,
+  logAdminOrderAction,
+  getOrderAuditLogs,
+  getAdminAuditLogs,
+};
