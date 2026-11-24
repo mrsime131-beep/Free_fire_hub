@@ -1,193 +1,194 @@
-import jwt from "jsonwebtoken";
-import { prisma } from "../config/db.js";
-import { env } from "../config/env.js";
-import { ApiError, asyncHandler } from "../utils/apiResponse.js";
+const jwt = require('jsonwebtoken');
+const env = require('../config/env');
+const prisma = require('../config/prisma');
 
 /**
- * Request Header থেকে Bearer JWT Token আলাদা করার হেল্পার ফাংশন
+ * Request Header বা Cookie থেকে JWT Token বের করার হেল্পার ফাংশন
  */
-function extractBearerToken(req) {
+const extractToken = (req) => {
   const authHeader = req.headers.authorization || req.headers.Authorization;
-  if (!authHeader || typeof authHeader !== "string") {
-    return null;
+  if (authHeader && typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+    return authHeader.slice(7).trim();
   }
 
-  const parts = authHeader.trim().split(" ");
-  if (parts.length !== 2 || parts[0].toLowerCase() !== "bearer") {
-    return null;
+  if (req.headers['x-access-token']) {
+    return String(req.headers['x-access-token']).trim();
   }
 
-  return parts[1];
-}
+  if (req.cookies && (req.cookies.ffh_token || req.cookies.token)) {
+    return req.cookies.ffh_token || req.cookies.token;
+  }
+
+  return null;
+};
 
 /**
- * ১. Strict Authentication Middleware (requireAuth)
- * যেসব API শুধুমাত্র লগইন করা ইউজারদের জন্য (যেমন: User Dashboard, My Orders, Referral Stats)
+ * ইউজারের জন্য নতুন JWT Token তৈরি করার হেল্পার ফাংশন
  */
-export const requireAuth = asyncHandler(async (req, res, next) => {
-  const token = extractBearerToken(req);
-
-  if (!token) {
-    throw new ApiError(
-      401,
-      "Authentication required. Please log in to access this resource.",
-      null,
-      "AUTH_TOKEN_MISSING"
-    );
-  }
-
-  let decoded;
-  try {
-    decoded = jwt.verify(token, env.JWT_SECRET);
-  } catch (error) {
-    if (error.name === "TokenExpiredError") {
-      throw new ApiError(
-        401,
-        "Your login session has expired. Please log in again.",
-        null,
-        "TOKEN_EXPIRED"
-      );
-    }
-    throw new ApiError(
-      401,
-      "Invalid authentication token.",
-      null,
-      "INVALID_TOKEN"
-    );
-  }
-
-  if (!decoded || !decoded.userId) {
-    throw new ApiError(
-      401,
-      "Malformed authentication token payload.",
-      null,
-      "MALFORMED_TOKEN"
-    );
-  }
-
-  const user = await prisma.user.findUnique({
-    where: { id: decoded.userId },
-    select: {
-      id: true,
-      name: true,
-      email: true,
-      phone: true,
-      role: true,
-      walletBalance: true,
-      rewardPoints: true,
-      referralCode: true,
-      savedUid: true,
-      savedPlayerName: true,
-      savedServer: true,
-      isActive: true,
-      createdAt: true,
+const generateToken = (user) => {
+  return jwt.sign(
+    {
+      id: user.id,
+      email: user.email,
+      role: user.role,
     },
-  });
-
-  if (!user) {
-    throw new ApiError(
-      401,
-      "User account associated with this token no longer exists.",
-      null,
-      "USER_NOT_FOUND"
-    );
-  }
-
-  if (!user.isActive) {
-    throw new ApiError(
-      403,
-      "Your account has been deactivated. Please contact support.",
-      null,
-      "ACCOUNT_DISABLED"
-    );
-  }
-
-  req.user = user;
-  return next();
-});
+    env.JWT_SECRET,
+    { expiresIn: env.JWT_EXPIRES_IN }
+  );
+};
 
 /**
- * ২. Optional Authentication Middleware (optionalAuth)
- * Guest Order এবং Order Checkout-এর জন্য অত্যন্ত গুরুত্বপূর্ণ।
- * ইউজার লগইন অবস্থায় থাকলে তার req.user যুক্ত করবে, আর লগইন না থাকলে (Guest হলে)
- * কোনো এরর না দিয়ে req.user = null রেখে অর্ডার সম্পন্ন করতে দেবে।
+ * ১. কঠোর অথেনটিকেশন মিডলওয়্যার (লগইন করা ইউজার ও অ্যাডমিনের জন্য)
  */
-export const optionalAuth = asyncHandler(async (req, res, next) => {
-  const token = extractBearerToken(req);
-
-  if (!token) {
-    req.user = null;
-    return next();
-  }
-
+const authenticate = async (req, res, next) => {
   try {
+    const token = extractToken(req);
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        error: 'UNAUTHORIZED',
+        message: 'অ্যাক্সেস অনুমোদিত নয়। অনুগ্রহ করে লগইন করুন।',
+      });
+    }
+
     const decoded = jwt.verify(token, env.JWT_SECRET);
-    if (!decoded || !decoded.userId) {
+
+    // ডাটাবেস থেকে ইউজার যাচাই করা
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.id },
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        phone: true,
+        role: true,
+        isActive: true,
+      },
+    });
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: 'USER_NOT_FOUND',
+        message: 'ইউজার অ্যাকাউন্টটি খুঁজে পাওয়া যায়নি। আবার লগইন করুন।',
+      });
+    }
+
+    if (!user.isActive) {
+      return res.status(403).json({
+        success: false,
+        error: 'ACCOUNT_DISABLED',
+        message: 'আপনার অ্যাকাউন্টটি সাময়িকভাবে স্থগিত করা হয়েছে।',
+      });
+    }
+
+    req.user = user;
+    next();
+  } catch (error) {
+    if (error.name === 'TokenExpiredError') {
+      return res.status(401).json({
+        success: false,
+        error: 'TOKEN_EXPIRED',
+        message: 'আপনার লগইন সেশনের মেয়াদ শেষ হয়েছে। অনুগ্রহ করে পুনরায় লগইন করুন।',
+      });
+    }
+
+    return res.status(401).json({
+      success: false,
+      error: 'INVALID_TOKEN',
+      message: 'অবৈধ লগইন টোকেন। অনুগ্রহ করে পুনরায় লগইন করুন।',
+    });
+  }
+};
+
+/**
+ * ২. অপশনাল অথেনটিকেশন মিডলওয়্যার (কাস্টমার ও গেস্ট উভয়ের চেকআউটের জন্য)
+ * টোকেন থাকলে req.user সেট করবে, না থাকলে Guest হিসেবে অর্ডার করতে দেবে।
+ */
+const optionalAuth = async (req, res, next) => {
+  try {
+    const token = extractToken(req);
+    const guestHeader = req.headers['x-guest-id'];
+    req.guestId = guestHeader ? String(guestHeader).trim() : null;
+
+    if (!token) {
       req.user = null;
       return next();
     }
 
+    const decoded = jwt.verify(token, env.JWT_SECRET);
     const user = await prisma.user.findUnique({
-      where: { id: decoded.userId },
+      where: { id: decoded.id },
       select: {
         id: true,
-        name: true,
         email: true,
+        name: true,
         phone: true,
         role: true,
-        walletBalance: true,
-        rewardPoints: true,
-        referralCode: true,
-        savedUid: true,
-        savedPlayerName: true,
-        savedServer: true,
         isActive: true,
       },
     });
 
     req.user = user && user.isActive ? user : null;
-  } catch {
-    // টোকেন মেয়াদোত্তীর্ণ বা ভুল হলেও Guest Checkout যাতে আটকে না যায়
+    next();
+  } catch (error) {
+    // টোকেন ভুল বা মেয়াদোত্তীর্ণ হলেও গেস্ট চেকআউট ব্লক করবে না
     req.user = null;
+    next();
+  }
+};
+
+/**
+ * ৩. সার্ভার-সাইড অ্যাডমিন অথরাইজেশন মিডলওয়্যার (শুধুমাত্র ADMIN ও SUPER_ADMIN)
+ */
+const requireAdmin = (req, res, next) => {
+  if (!req.user) {
+    return res.status(401).json({
+      success: false,
+      error: 'UNAUTHORIZED',
+      message: 'অ্যাডমিন প্যানেলে প্রবেশের জন্য প্রথমে লগইন করুন।',
+    });
   }
 
-  return next();
-});
+  const allowedRoles = ['ADMIN', 'SUPER_ADMIN'];
+  if (!allowedRoles.includes(req.user.role)) {
+    return res.status(403).json({
+      success: false,
+      error: 'FORBIDDEN_ADMIN_ACCESS',
+      message: 'এই অ্যাকশনটি শুধুমাত্র অনুমোদিত অ্যাডমিনের জন্য সংরক্ষিত।',
+    });
+  }
+
+  next();
+};
 
 /**
- * ৩. Role-Based Authorization Middleware (requireRole)
- * নির্দিষ্ট রোল (যেমন: ADMIN বা CUSTOMER) ছাড়া এক্সেস ব্লক করার জন্য
+ * ৪. কাস্টম রোল অথরাইজেশন মিডলওয়্যার
  */
-export function requireRole(...allowedRoles) {
+const authorizeRoles = (...allowedRoles) => {
   return (req, res, next) => {
-    if (!req.user) {
-      return next(
-        new ApiError(
-          401,
-          "Authentication required before verifying permissions.",
-          null,
-          "AUTH_REQUIRED"
-        )
-      );
+    if (!req.user || !allowedRoles.includes(req.user.role)) {
+      return res.status(403).json({
+        success: false,
+        error: 'FORBIDDEN_ROLE',
+        message: 'আপনার এই রিসোর্সটি ব্যবহারের অনুমতি নেই।',
+      });
     }
-
-    if (!allowedRoles.includes(req.user.role)) {
-      return next(
-        new ApiError(
-          403,
-          "Access denied. You do not have permission to perform this action.",
-          null,
-          "FORBIDDEN_ROLE"
-        )
-      );
-    }
-
-    return next();
+    next();
   };
-}
+};
 
-/**
- * ৪. Admin Only Shortcut Middleware (requireAdmin)
- * পেমেন্ট ভেরিফিকেশন, প্রোডাক্ট প্রাইস আপডেট ও ম্যানুয়াল ডেলিভারি ট্রিগারের জন্য
- */
-export const requireAdmin = [requireAuth, requireRole("ADMIN")];
+module.exports = {
+  extractToken,
+  generateToken,
+  authenticate,
+  optionalAuth,
+  requireAdmin,
+  authorizeRoles,
+  // আগের কোডের সাথে সামঞ্জস্য রাখার জন্য Aliases
+  protect: authenticate,
+  verifyToken: authenticate,
+  adminOnly: requireAdmin,
+  isAdmin: requireAdmin,
+};
