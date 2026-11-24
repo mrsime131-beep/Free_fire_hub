@@ -1,449 +1,294 @@
-import { PrismaClient } from "@prisma/client";
-import bcrypt from "bcryptjs";
-import dotenv from "dotenv";
+const { PrismaClient } = require('@prisma/client');
 
-dotenv.config();
+// Crash-proof bcrypt loader (supports both bcryptjs and bcrypt)
+let bcrypt;
+try {
+  bcrypt = require('bcryptjs');
+} catch (err) {
+  bcrypt = require('bcrypt');
+}
 
 const prisma = new PrismaClient();
 
 async function main() {
-  console.log("🚀 Starting Free Fire Hub BD Database Seeding...");
+  console.log('🌱 Starting Free Fire Hub (Project 03) Database Seeding...');
 
-  // ==========================================================================
-  // 1. SEED DEFAULT ADMIN USER
-  // ==========================================================================
-  const adminEmail = process.env.ADMIN_DEFAULT_EMAIL || "admin@freefirehub.bd";
-  const adminPassword =
-    process.env.ADMIN_DEFAULT_PASSWORD || "ChangeThisAdminPassword123!";
-  const passwordHash = await bcrypt.hash(adminPassword, 12);
+  // ==========================================
+  // 1. SEED ADMIN ACCOUNT
+  // ==========================================
+  const adminEmail = (process.env.ADMIN_EMAIL || 'mrsadhin131@gmail.com').trim().toLowerCase();
+  const adminPassword = process.env.ADMIN_PASSWORD || '7681573669';
+  const adminPhone = process.env.ADMIN_PHONE || '01623759878';
+
+  const passwordHash = await bcrypt.hash(adminPassword, 10);
 
   const adminUser = await prisma.user.upsert({
     where: { email: adminEmail },
     update: {
-      role: "ADMIN",
-      isActive: true,
-    },
-    create: {
-      name: "FFH Super Admin",
-      email: adminEmail,
-      phone: "01700000000",
       passwordHash,
-      role: "ADMIN",
-      walletBalance: 0,
-      rewardPoints: 1000,
-      referralCode: "FFHADMIN01",
-      savedServer: "BD",
+      phone: adminPhone,
+      role: 'ADMIN',
+      isActive: true,
+    },
+    create: {
+      email: adminEmail,
+      passwordHash,
+      name: 'Free Fire Hub Admin',
+      phone: adminPhone,
+      role: 'ADMIN',
       isActive: true,
     },
   });
-  console.log(`✅ Admin user ready: ${adminUser.email}`);
 
-  // ==========================================================================
-  // 2. SEED PRODUCT CATEGORIES
-  // ==========================================================================
-  const categoriesData = [
-    {
-      name: "Regular Diamonds",
-      slug: "regular",
-      description: "Instant Free Fire BD Server UID Diamond Top-Up",
-      badgeText: "INSTANT UID",
-      displayOrder: 1,
-      isActive: true,
-    },
-    {
-      name: "Memberships",
-      slug: "membership",
-      description: "Weekly, Monthly & Lite Memberships with daily rewards",
-      badgeText: "BEST VALUE",
-      displayOrder: 2,
-      isActive: true,
-    },
-    {
-      name: "Special Passes",
-      slug: "special",
-      description: "Level Up Pass and EVO Gun Access Pass",
-      badgeText: "SPECIAL",
-      displayOrder: 3,
-      isActive: true,
-    },
-  ];
+  console.log(`👑 Admin user verified/configured: ${adminUser.email} (Phone: ${adminUser.phone})`);
 
-  const categoryMap = {};
-
-  for (const cat of categoriesData) {
-    const savedCategory = await prisma.category.upsert({
-      where: { slug: cat.slug },
-      update: {
-        name: cat.name,
-        description: cat.description,
-        badgeText: cat.badgeText,
-        displayOrder: cat.displayOrder,
-        isActive: cat.isActive,
-      },
-      create: cat,
-    });
-    categoryMap[cat.slug] = savedCategory.id;
-  }
-  console.log("✅ Categories seeded: Regular, Memberships, Special Passes");
-
-  // ==========================================================================
-  // 3. SEED ALL 13 DYNAMIC DIAMOND & MEMBERSHIP PRODUCTS
-  // ==========================================================================
-  const productsData = [
-    // --- Regular Diamonds ---
+  // ==========================================
+  // 2. SEED DIAMOND PACKAGES (SERVER-SIDE PRICING)
+  // ==========================================
+  const diamondPackages = [
     {
-      sku: "FFH-25D",
-      name: "25 Diamonds",
-      slug: "25-diamonds",
-      categoryId: categoryMap["regular"],
-      diamondQuantity: 25,
+      name: '25 Diamonds',
+      slug: '25-diamonds',
+      sku: 'FFH-BD-025',
+      category: 'DIAMOND_TOPUP',
+      game: 'FREE_FIRE',
+      diamondAmount: 25,
       bonusDiamonds: 0,
-      purchasePrice: 20,
-      sellingPrice: 25,
-      discount: 3,
-      imageUrl: "/images/diamonds-small.png",
-      tag: "STARTER",
+      basePrice: 25.00,
+      discountAmount: 3.00,
+      sellingPrice: 22.00,
       isPopular: false,
-      availability: "IN_STOCK",
-      isActive: true,
-      displayOrder: 1,
-      supplierCode: "FF_BD_25",
-      description: "25 Free Fire Diamonds instant top-up via Player UID (BD Server).",
+      sortOrder: 1,
+      description: 'Fast Free Fire BD Server 25 Diamonds Top-Up via Player UID.',
+      costPrice: 19.50,
     },
     {
-      sku: "FFH-50D",
-      name: "50 Diamonds",
-      slug: "50-diamonds",
-      categoryId: categoryMap["regular"],
-      diamondQuantity: 50,
-      bonusDiamonds: 0,
-      purchasePrice: 38,
-      sellingPrice: 45,
-      discount: 5,
-      imageUrl: "/images/diamonds-small.png",
-      tag: null,
-      isPopular: false,
-      availability: "IN_STOCK",
-      isActive: true,
-      displayOrder: 2,
-      supplierCode: "FF_BD_50",
-      description: "50 Free Fire Diamonds instant top-up via Player UID (BD Server).",
-    },
-    {
-      sku: "FFH-115D",
-      name: "115 Diamonds",
-      slug: "115-diamonds",
-      categoryId: categoryMap["regular"],
-      diamondQuantity: 115,
+      name: '50 Diamonds',
+      slug: '50-diamonds',
+      sku: 'FFH-BD-050',
+      category: 'DIAMOND_TOPUP',
+      game: 'FREE_FIRE',
+      diamondAmount: 50,
       bonusDiamonds: 5,
-      purchasePrice: 76,
-      sellingPrice: 85,
-      discount: 10,
-      imageUrl: "/images/diamonds-medium.png",
-      tag: "HOT",
-      isPopular: true,
-      availability: "IN_STOCK",
-      isActive: true,
-      displayOrder: 3,
-      supplierCode: "FF_BD_115",
-      description: "115 Free Fire Diamonds instant top-up via Player UID (BD Server).",
+      basePrice: 45.00,
+      discountAmount: 3.00,
+      sellingPrice: 42.00,
+      isPopular: false,
+      sortOrder: 2,
+      description: 'Fast Free Fire BD Server 50 Diamonds Top-Up via Player UID.',
+      costPrice: 38.00,
     },
     {
-      sku: "FFH-240D",
-      name: "240 Diamonds",
-      slug: "240-diamonds",
-      categoryId: categoryMap["regular"],
-      diamondQuantity: 240,
+      name: '115 Diamonds',
+      slug: '115-diamonds',
+      sku: 'FFH-BD-115',
+      category: 'DIAMOND_TOPUP',
+      game: 'FREE_FIRE',
+      diamondAmount: 115,
       bonusDiamonds: 10,
-      purchasePrice: 152,
-      sellingPrice: 170,
-      discount: 15,
-      imageUrl: "/images/diamonds-medium.png",
-      tag: "BEST SELLER",
+      basePrice: 95.00,
+      discountAmount: 10.00,
+      sellingPrice: 85.00,
       isPopular: true,
-      availability: "IN_STOCK",
-      isActive: true,
-      displayOrder: 4,
-      supplierCode: "FF_BD_240",
-      description: "240 Free Fire Diamonds instant top-up via Player UID (BD Server).",
+      sortOrder: 3,
+      description: 'Most Popular 115 Diamonds Pack for Free Fire BD Server.',
+      costPrice: 78.00,
     },
     {
-      sku: "FFH-610D",
-      name: "610 Diamonds",
-      slug: "610-diamonds",
-      categoryId: categoryMap["regular"],
-      diamondQuantity: 610,
-      bonusDiamonds: 25,
-      purchasePrice: 385,
-      sellingPrice: 425,
-      discount: 25,
-      imageUrl: "/images/diamonds-large.png",
-      tag: "VALUE PACK",
-      isPopular: false,
-      availability: "IN_STOCK",
-      isActive: true,
-      displayOrder: 5,
-      supplierCode: "FF_BD_610",
-      description: "610 Free Fire Diamonds instant top-up via Player UID (BD Server).",
+      name: '240 Diamonds',
+      slug: '240-diamonds',
+      sku: 'FFH-BD-240',
+      category: 'DIAMOND_TOPUP',
+      game: 'FREE_FIRE',
+      diamondAmount: 240,
+      bonusDiamonds: 20,
+      basePrice: 185.00,
+      discountAmount: 15.00,
+      sellingPrice: 170.00,
+      isPopular: true,
+      sortOrder: 4,
+      description: 'Best Value 240 Diamonds Bundle for Free Fire BD Server.',
+      costPrice: 156.00,
     },
     {
-      sku: "FFH-1240D",
-      name: "1240 Diamonds",
-      slug: "1240-diamonds",
-      categoryId: categoryMap["regular"],
-      diamondQuantity: 1240,
+      name: '610 Diamonds',
+      slug: '610-diamonds',
+      sku: 'FFH-BD-610',
+      category: 'DIAMOND_TOPUP',
+      game: 'FREE_FIRE',
+      diamondAmount: 610,
       bonusDiamonds: 50,
-      purchasePrice: 770,
-      sellingPrice: 850,
-      discount: 50,
-      imageUrl: "/images/diamonds-large.png",
-      tag: "PRO CHOICE",
+      basePrice: 450.00,
+      discountAmount: 30.00,
+      sellingPrice: 420.00,
       isPopular: true,
-      availability: "IN_STOCK",
-      isActive: true,
-      displayOrder: 6,
-      supplierCode: "FF_BD_1240",
-      description: "1240 Free Fire Diamonds instant top-up via Player UID (BD Server).",
+      sortOrder: 5,
+      description: 'Mega Pack 610 Diamonds for Free Fire BD Server.',
+      costPrice: 390.00,
     },
     {
-      sku: "FFH-2530D",
-      name: "2530 Diamonds",
-      slug: "2530-diamonds",
-      categoryId: categoryMap["regular"],
-      diamondQuantity: 2530,
+      name: '1240 Diamonds',
+      slug: '1240-diamonds',
+      sku: 'FFH-BD-1240',
+      category: 'DIAMOND_TOPUP',
+      game: 'FREE_FIRE',
+      diamondAmount: 1240,
       bonusDiamonds: 100,
-      purchasePrice: 1540,
-      sellingPrice: 1700,
-      discount: 100,
-      imageUrl: "/images/diamonds-chest.png",
-      tag: "ELITE",
+      basePrice: 900.00,
+      discountAmount: 50.00,
+      sellingPrice: 850.00,
       isPopular: false,
-      availability: "IN_STOCK",
-      isActive: true,
-      displayOrder: 7,
-      supplierCode: "FF_BD_2530",
-      description: "2530 Free Fire Diamonds instant top-up via Player UID (BD Server).",
+      sortOrder: 6,
+      description: 'Pro Gamer 1240 Diamonds Pack for Free Fire BD Server.',
+      costPrice: 790.00,
     },
     {
-      sku: "FFH-5060D",
-      name: "5060 Diamonds",
-      slug: "5060-diamonds",
-      categoryId: categoryMap["regular"],
-      diamondQuantity: 5060,
-      bonusDiamonds: 200,
-      purchasePrice: 3080,
-      sellingPrice: 3380,
-      discount: 220,
-      imageUrl: "/images/diamonds-chest.png",
-      tag: "MEGA VAULT",
+      name: '2530 Diamonds',
+      slug: '2530-diamonds',
+      sku: 'FFH-BD-2530',
+      category: 'DIAMOND_TOPUP',
+      game: 'FREE_FIRE',
+      diamondAmount: 2530,
+      bonusDiamonds: 220,
+      basePrice: 1800.00,
+      discountAmount: 100.00,
+      sellingPrice: 1700.00,
       isPopular: false,
-      availability: "IN_STOCK",
-      isActive: true,
-      displayOrder: 8,
-      supplierCode: "FF_BD_5060",
-      description: "5060 Free Fire Diamonds instant top-up via Player UID (BD Server).",
+      sortOrder: 7,
+      description: 'Ultimate 2530 Diamonds Vault Pack for Free Fire BD Server.',
+      costPrice: 1590.00,
     },
-
-    // --- Memberships ---
     {
-      sku: "FFH-WEEKLY",
-      name: "Weekly Membership",
-      slug: "weekly-membership",
-      categoryId: categoryMap["membership"],
-      diamondQuantity: 450,
+      name: 'Weekly Membership',
+      slug: 'weekly-membership',
+      sku: 'FFH-BD-WEEKLY',
+      category: 'MEMBERSHIP',
+      game: 'FREE_FIRE',
+      diamondAmount: 450,
       bonusDiamonds: 0,
-      purchasePrice: 142,
-      sellingPrice: 160,
-      discount: 20,
-      imageUrl: "/images/weekly-membership.png",
-      tag: "MOST POPULAR",
+      basePrice: 170.00,
+      discountAmount: 15.00,
+      sellingPrice: 155.00,
       isPopular: true,
-      availability: "IN_STOCK",
-      isActive: true,
-      displayOrder: 9,
-      supplierCode: "FF_BD_WEEKLY",
-      description: "Instant 100 Diamonds + 50 Diamonds daily for 7 days (Total 450 Diamonds).",
+      sortOrder: 8,
+      description: 'Free Fire Weekly Membership (Instant + Daily Diamonds Rewards).',
+      costPrice: 142.00,
     },
     {
-      sku: "FFH-MONTHLY",
-      name: "Monthly Membership",
-      slug: "monthly-membership",
-      categoryId: categoryMap["membership"],
-      diamondQuantity: 2600,
+      name: 'Monthly Membership',
+      slug: 'monthly-membership',
+      sku: 'FFH-BD-MONTHLY',
+      category: 'MEMBERSHIP',
+      game: 'FREE_FIRE',
+      diamondAmount: 2600,
       bonusDiamonds: 0,
-      purchasePrice: 710,
-      sellingPrice: 780,
-      discount: 70,
-      imageUrl: "/images/monthly-membership.png",
-      tag: "MAX SAVING",
+      basePrice: 820.00,
+      discountAmount: 50.00,
+      sellingPrice: 770.00,
       isPopular: true,
-      availability: "IN_STOCK",
-      isActive: true,
-      displayOrder: 10,
-      supplierCode: "FF_BD_MONTHLY",
-      description: "Instant 500 Diamonds + 70 Diamonds daily for 30 days (Total 2600 Diamonds).",
-    },
-    {
-      sku: "FFH-WEEKLY-LITE",
-      name: "Weekly Lite",
-      slug: "weekly-lite",
-      categoryId: categoryMap["membership"],
-      diamondQuantity: 100,
-      bonusDiamonds: 0,
-      purchasePrice: 38,
-      sellingPrice: 45,
-      discount: 5,
-      imageUrl: "/images/weekly-lite.png",
-      tag: "BUDGET PASS",
-      isPopular: false,
-      availability: "IN_STOCK",
-      isActive: true,
-      displayOrder: 11,
-      supplierCode: "FF_BD_WEEKLY_LITE",
-      description: "Weekly Lite Membership for budget daily diamond rewards via Player UID.",
-    },
-
-    // --- Special Passes ---
-    {
-      sku: "FFH-LEVEL-UP",
-      name: "Level Up Pass",
-      slug: "level-up-pass",
-      categoryId: categoryMap["special"],
-      diamondQuantity: 800,
-      bonusDiamonds: 0,
-      purchasePrice: 140,
-      sellingPrice: 165,
-      discount: 25,
-      imageUrl: "/images/level-up-pass.png",
-      tag: "800💎 REWARD",
-      isPopular: true,
-      availability: "IN_STOCK",
-      isActive: true,
-      displayOrder: 12,
-      supplierCode: "FF_BD_LEVEL_UP",
-      description: "Unlock up to 800 Diamonds based on your Free Fire account level milestones.",
-    },
-    {
-      sku: "FFH-EVO-PASS",
-      name: "EVO Pass",
-      slug: "evo-pass",
-      categoryId: categoryMap["special"],
-      diamondQuantity: 0,
-      bonusDiamonds: 0,
-      purchasePrice: 82,
-      sellingPrice: 100,
-      discount: 15,
-      imageUrl: "/images/evo-pass.png",
-      tag: "EVO GUNS",
-      isPopular: false,
-      availability: "IN_STOCK",
-      isActive: true,
-      displayOrder: 13,
-      supplierCode: "FF_BD_EVO_PASS",
-      description: "7 Days EVO Access Badge with exclusive Evo Gun trial & crate benefits.",
+      sortOrder: 9,
+      description: 'Free Fire Monthly Membership (Mega Diamond Rewards).',
+      costPrice: 720.00,
     },
   ];
 
-  for (const product of productsData) {
-    await prisma.product.upsert({
-      where: { sku: product.sku },
+  const createdProducts = [];
+
+  for (const pkg of diamondPackages) {
+    const { costPrice, ...productData } = pkg;
+
+    const savedProduct = await prisma.product.upsert({
+      where: { slug: productData.slug },
       update: {
-        name: product.name,
-        slug: product.slug,
-        categoryId: product.categoryId,
-        diamondQuantity: product.diamondQuantity,
-        bonusDiamonds: product.bonusDiamonds,
-        purchasePrice: product.purchasePrice,
-        sellingPrice: product.sellingPrice,
-        discount: product.discount,
-        imageUrl: product.imageUrl,
-        tag: product.tag,
-        isPopular: product.isPopular,
-        availability: product.availability,
-        isActive: product.isActive,
-        displayOrder: product.displayOrder,
-        supplierCode: product.supplierCode,
-        description: product.description,
+        name: productData.name,
+        sku: productData.sku,
+        category: productData.category,
+        game: productData.game,
+        diamondAmount: productData.diamondAmount,
+        bonusDiamonds: productData.bonusDiamonds,
+        basePrice: productData.basePrice,
+        discountAmount: productData.discountAmount,
+        sellingPrice: productData.sellingPrice,
+        isPopular: productData.isPopular,
+        sortOrder: productData.sortOrder,
+        description: productData.description,
+        isActive: true,
       },
-      create: product,
+      create: {
+        ...productData,
+        currency: 'BDT',
+        isActive: true,
+      },
+    });
+
+    createdProducts.push({ product: savedProduct, costPrice });
+  }
+
+  console.log(`💎 Seeded ${createdProducts.length} Free Fire Diamond & Membership packages.`);
+
+  // ==========================================
+  // 3. SEED DEFAULT DEMO SUPPLIER & PRODUCT MAPPINGS
+  // ==========================================
+  const demoSupplier = await prisma.supplier.upsert({
+    where: { code: 'DEMO_SUPPLIER' },
+    update: {
+      name: 'FreeFireHub Safe Demo Supplier Engine (DEMO MODE)',
+      adapterType: 'DEMO',
+      timeoutMs: 12000,
+      isActive: true,
+      priority: 1,
+      metadata: {
+        isRealDelivery: false,
+        notice: 'DEMO MODE ONLY - Does not send real diamonds until live supplier API is configured.',
+      },
+    },
+    create: {
+      code: 'DEMO_SUPPLIER',
+      name: 'FreeFireHub Safe Demo Supplier Engine (DEMO MODE)',
+      adapterType: 'DEMO',
+      apiEndpoint: null,
+      apiKeyEnvVar: 'SUPPLIER_API_KEY',
+      apiSecretEnvVar: 'SUPPLIER_API_SECRET',
+      timeoutMs: 12000,
+      isActive: true,
+      priority: 1,
+      metadata: {
+        isRealDelivery: false,
+        notice: 'DEMO MODE ONLY - Does not send real diamonds until live supplier API is configured.',
+      },
+    },
+  });
+
+  for (const item of createdProducts) {
+    await prisma.supplierProduct.upsert({
+      where: {
+        supplierId_productId: {
+          supplierId: demoSupplier.id,
+          productId: item.product.id,
+        },
+      },
+      update: {
+        externalProductCode: `EXT_${item.product.sku}`,
+        costPrice: item.costPrice,
+        isActive: true,
+      },
+      create: {
+        supplierId: demoSupplier.id,
+        productId: item.product.id,
+        externalProductCode: `EXT_${item.product.sku}`,
+        costPrice: item.costPrice,
+        isActive: true,
+      },
     });
   }
-  console.log(`✅ All ${productsData.length} Diamond & Membership Products seeded.`);
 
-  // ==========================================================================
-  // 4. SEED MODULAR SUPPLIER CONFIGURATION (DEMO & LIVE ADAPTER SLOTS)
-  // ==========================================================================
-  await prisma.supplier.upsert({
-    where: { code: "DEMO_MOCK_SUPPLIER" },
-    update: {
-      isActive: true,
-      isDemoMode: true,
-    },
-    create: {
-      name: "FFH Internal Demo Delivery Engine (Sandbox)",
-      code: "DEMO_MOCK_SUPPLIER",
-      baseUrl: "internal://demo-supplier-sandbox",
-      isActive: true,
-      isDemoMode: true,
-      priority: 1,
-      timeoutMs: 10000,
-      maxRetries: 3,
-      configJson: {
-        mode: "DEMO",
-        notice:
-          "Clearly marked DEMO delivery provider. Does not claim real Garena live top-up until an official Supplier API is connected.",
-      },
-    },
-  });
-
-  await prisma.supplier.upsert({
-    where: { code: "OFFICIAL_LIVE_SUPPLIER" },
-    update: {},
-    create: {
-      name: "Official Top-Up Supplier API (Configure Before Live Activation)",
-      code: "OFFICIAL_LIVE_SUPPLIER",
-      baseUrl: process.env.SUPPLIER_API_BASE_URL || "",
-      isActive: false,
-      isDemoMode: false,
-      priority: 2,
-      timeoutMs: 15000,
-      maxRetries: 3,
-      configJson: {
-        mode: "LIVE",
-        requiresOfficialApiKey: true,
-      },
-    },
-  });
-  console.log("✅ Modular Suppliers seeded (DEMO active, LIVE ready for API credentials).");
-
-  // ==========================================================================
-  // 5. SEED DEFAULT PROMO COUPON
-  // ==========================================================================
-  await prisma.coupon.upsert({
-    where: { code: "FFHUB10" },
-    update: {
-      isActive: true,
-    },
-    create: {
-      code: "FFHUB10",
-      description: "৳10 Instant Discount on orders above ৳150",
-      discountType: "FIXED",
-      discountValue: 10,
-      minOrderAmount: 150,
-      maxDiscount: 10,
-      maxUses: 500,
-      usedCount: 0,
-      isActive: true,
-    },
-  });
-  console.log("✅ Default promo coupon 'FFHUB10' seeded.");
-
-  console.log("🎉 Database seeding completed successfully!");
+  console.log(`🔌 Supplier "${demoSupplier.code}" and ${createdProducts.length} product mappings configured.`);
+  console.log('✅ Project 03 Database Seeding Completed Successfully!');
 }
 
 main()
   .catch((error) => {
-    console.error("❌ Error during database seeding:", error);
+    console.error('❌ Database Seeding Failed:', error);
     process.exit(1);
   })
   .finally(async () => {
