@@ -418,4 +418,40 @@ export async function getAllDeliveriesForAdmin(query = {}) {
     whereClause.status = String(query.status).trim().toUpperCase();
   }
 
-  if (query.player
+  if (query.playerUid) {
+    whereClause.playerUid = String(query.playerUid).trim();
+  }
+
+  const [deliveries, totalCount] = await Promise.all([
+    prisma.delivery.findMany({
+      where: whereClause,
+      include: {
+        order: {
+          select: {
+            id: true,
+            orderNumber: true,
+            payableAmount: true,
+            paymentMethod: true,
+            paymentStatus: true,
+            orderStatus: true,
+            createdAt: true,
+          },
+        },
+      },
+      orderBy: { updatedAt: "desc" },
+      skip,
+      take: limit,
+    }),
+    prisma.delivery.count({ where: whereClause }),
+  ]);
+
+  return {
+    deliveries,
+    meta: {
+      page,
+      limit,
+      total: totalCount,
+      totalPages: Math.ceil(totalCount / limit) || 1,
+    },
+  };
+}
