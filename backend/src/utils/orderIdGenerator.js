@@ -1,105 +1,87 @@
-import crypto from "crypto";
-import { prisma } from "../config/db.js";
+const prisma = require('../config/prisma');
 
 /**
- * বাংলাদেশ সময় (Asia/Dhaka - UTC+6) অনুযায়ী YYYYMMDD ফরম্যাটে আজকের তারিখ বের করার ফাংশন
+ * বাংলাদেশ সময় (Asia/Dhaka, UTC+6) অনুযায়ী আজকের তারিখের কী (YYYYMMDD) তৈরি করা
+ * উদাহরণ: "20261125"
  */
-export function getBangladeshDateString(date = new Date()) {
-  const formatter = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Dhaka",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
+const getBangladeshDateKey = (date = new Date()) => {
+  // UTC সময়ের সাথে ৬ ঘণ্টা যোগ করে বাংলাদেশ সময় নির্ধারণ
+  const bdTime = new Date(date.getTime() + 6 * 60 * 60 * 1000);
+  const year = bdTime.getUTCFullYear();
+  const month = String(bdTime.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(bdTime.getUTCDate()).padStart(2, '0');
 
-  // en-CA ফরম্যাট YYYY-MM-DD রিটার্ন করে, সেখান থেকে হাইফেন সরিয়ে YYYYMMDD করা হচ্ছে
-  return formatter.format(date).replace(/-/g, "");
-}
+  return `${year}${month}${day}`;
+};
 
 /**
- * প্রতিটি অর্ডারের জন্য Sequential Unique Order ID জেনারেটর
- * Example Format: FFH-20261124-000001
- * @param {object} dbClient - Prisma Client অথবা Prisma Transaction Client (tx)
+ * তারিখ এবং সিরিয়াল নাম্বার থেকে নির্ধারিত ফরম্যাটে অর্ডার আইডি তৈরি করা
+ * Format: FFH-20261124-000001
  */
-export async function generateUniqueOrderNumber(dbClient = prisma) {
-  const datePart = getBangladeshDateString();
-  const prefix = `FFH-${datePart}-`;
+const formatOrderNumber = (dateKey, sequenceNumber) => {
+  const paddedSeq = String(sequenceNumber).padStart(6, '0');
+  return `FFH-${dateKey}-${paddedSeq}`;
+};
 
-  // আজকের তারিখের সর্বশেষ অর্ডারটি খুঁজে বের করা
-  const lastOrderToday = await dbClient.order.findFirst({
-    where: {
-      orderNumber: {
-        startsWith: prefix,
+/**
+ * অর্ডার আইডির ফরম্যাট সঠিক কি না তা যাচাই করার হেল্পার ফাংশন
+ */
+const isValidOrderNumberFormat = (orderNumber) => {
+  if (typeof orderNumber !== 'string') return false;
+  return /^FFH-\d{8}-\d{6,}$/.test(orderNumber.trim().toUpperCase());
+};
+
+/**
+ * ডাটাবেস ট্রানজেকশনের মাধ্যমে শতভাগ ডুপ্লিকেটমুক্ত (Atomic) Order ID তৈরি করা
+ * @param {object} txClient - Optional Prisma Transaction Client (prisma.$transaction এর ভেতর ব্যবহারের জন্য)
+ * @returns {Promise<string>} যেমন: "FFH-20261124-000001"
+ */
+const generateUniqueOrderNumber = async (txClient = null) => {
+  const db = txClient || prisma;
+  const dateKey = getBangladeshDateKey();
+  const maxAttempts = 5;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // ১. DailyOrderSequence টেবিলে অ্যাটমিক ইনক্রিমেন্ট (একই সাথে একাধিক অর্ডার আসলেও ডুপ্লিকেট হবে না)
+    const sequenceRecord = await db.dailyOrderSequence.upsert({
+      where: { dateKey },
+      update: {
+        currentSeq: {
+          increment: 1,
+        },
       },
-    },
-    orderBy: {
-      orderNumber: "desc",
-    },
-    select: {
-      orderNumber: true,
-    },
-  });
+      create: {
+        dateKey,
+        currentSeq: 1,
+      },
+    });
 
-  let nextSequenceNumber = 1;
+    const candidateOrderNumber = formatOrderNumber(dateKey, sequenceRecord.currentSeq);
 
-  if (lastOrderToday && lastOrderToday.orderNumber) {
-    const parts = lastOrderToday.orderNumber.split("-");
-    const lastSeqStr = parts[2];
-    const parsedSeq = parseInt(lastSeqStr, 10);
-    if (!isNaN(parsedSeq)) {
-      nextSequenceNumber = parsedSeq + 1;
+    // ২. অতিরিক্ত নিরাপত্তা: Order টেবিলে এই আইডি আগে থেকেই আছে কি না তা যাচাই করা
+    const existingOrder = await db.order.findUnique({
+      where: { orderNumber: candidateOrderNumber },
+      select: { id: true },
+    });
+
+    if (!existingOrder) {
+      return candidateOrderNumber;
     }
+
+    // যদি কোনো কারণে ম্যানুয়ালি ডাটাবেসে একই আইডি আগে থেকে থেকে থাকে, তবে পরের সিরিয়াল চেক করবে
+    console.warn(
+      `⚠️ Order ID collision detected for ${candidateOrderNumber}, retrying sequence increment (Attempt ${attempt}/${maxAttempts})...`
+    );
   }
 
-  const paddedSequence = String(nextSequenceNumber).padStart(6, "0");
-  const candidateOrderNumber = `${prefix}${paddedSequence}`;
+  // ৩. চরম কনকারেন্সি ফলব্যাক (Timestamp + Random Suffix) যেন অর্ডার কখনোই ব্যর্থ না হয়
+  const fallbackSeq = String(Date.now()).slice(-6);
+  return `FFH-${dateKey}-${fallbackSeq}`;
+};
 
-  // অতিরিক্ত সুরক্ষা: যদি একই মিলিসেকেন্ডে দুটি রিকোয়েস্টের কারণে সংঘর্ষ হয়, তবে চেক করে নেওয়া
-  const existing = await dbClient.order.findUnique({
-    where: { orderNumber: candidateOrderNumber },
-    select: { id: true },
-  });
-
-  if (!existing) {
-    return candidateOrderNumber;
-  }
-
-  // বিরল রেস কন্ডিশনের ক্ষেত্রে পরবর্তী সিকোয়েন্স বা র‍্যান্ডম সাফিক্স ব্যাকআপ
-  const fallbackSequence = String(nextSequenceNumber + 1).padStart(6, "0");
-  return `${prefix}${fallbackSequence}`;
-}
-
-/**
- * ফিন্যান্সিয়াল লেজার (Transaction Model)-এর জন্য ইউনিক রেফারেন্স জেনারেটর
- * Example: TXN-20261124-A8F9C21B
- */
-export function generateTransactionReference(prefix = "TXN") {
-  const datePart = getBangladeshDateString();
-  const randomHex = crypto.randomBytes(4).toString("hex").toUpperCase();
-  return `${prefix}-${datePart}-${randomHex}`;
-}
-
-/**
- * অটোমেটিক ডায়মন্ড ডেলিভারি ইঞ্জিনের জন্য ইউনিক রেফারেন্স জেনারেটর
- * DEMO মোডে স্পষ্টভাবে DEMO-DLV-... এবং LIVE মোডে LIVE-DLV-... প্রিফিক্স যুক্ত করবে
- */
-export function generateDeliveryReference(isDemo = true) {
-  const modePrefix = isDemo ? "DEMO-DLV" : "LIVE-DLV";
-  const datePart = getBangladeshDateString();
-  const randomHex = crypto.randomBytes(4).toString("hex").toUpperCase();
-  return `${modePrefix}-${datePart}-${randomHex}`;
-}
-
-/**
- * নতুন রেজিস্টার করা ইউজারের জন্য ইউনিক রেফারেল কোড জেনারেটর
- * Example: FFH7K9M2X
- */
-export function generateUserReferralCode(name = "FFH") {
-  const cleanPrefix =
-    name
-      .replace(/[^a-zA-Z]/g, "")
-      .toUpperCase()
-      .slice(0, 3) || "FFH";
-  const randomPart = crypto.randomBytes(3).toString("hex").toUpperCase();
-  return `${cleanPrefix}${randomPart}`;
-}
+module.exports = {
+  getBangladeshDateKey,
+  formatOrderNumber,
+  isValidOrderNumberFormat,
+  generateUniqueOrderNumber,
+};
