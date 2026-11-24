@@ -1,0 +1,445 @@
+// ============================================================================
+// FREE FIRE HUB BD — PRODUCTION POSTGRESQL PRISMA SCHEMA
+// Models: User, Category, Product, Order, OrderItem, Payment, Transaction,
+//         Supplier, Delivery, Referral, Coupon, AuditLog, Notification
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+enum UserRole {
+  CUSTOMER
+  ADMIN
+}
+
+enum ProductAvailability {
+  IN_STOCK
+  OUT_OF_STOCK
+  COMING_SOON
+}
+
+enum GameServer {
+  BD
+  INDIA
+  SINGAPORE
+  OTHER
+}
+
+enum OrderStatus {
+  PENDING
+  PAYMENT_REVIEW
+  PAID
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+  REFUNDED
+}
+
+enum PaymentMethod {
+  BKASH
+  NAGAD
+  ROCKET
+  MANUAL
+}
+
+enum PaymentStatus {
+  UNPAID
+  UNDER_REVIEW
+  VERIFIED
+  REJECTED
+  REFUNDED
+}
+
+enum TransactionType {
+  ORDER_PAYMENT
+  REFUND
+  WALLET_TOPUP
+  REWARD_EARNED
+  REWARD_REDEEM
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REVERSED
+}
+
+enum DeliveryStatus {
+  QUEUED
+  PROCESSING
+  DELIVERED
+  DEMO_DELIVERED
+  FAILED
+  RETRY_SCHEDULED
+}
+
+enum DiscountType {
+  PERCENTAGE
+  FIXED
+}
+
+enum ReferralStatus {
+  PENDING
+  COMPLETED
+}
+
+// ============================================================================
+// 1. USER MODEL
+// ============================================================================
+
+model User {
+  id               String         @id @default(uuid())
+  name             String
+  email            String         @unique
+  phone            String?        @unique
+  passwordHash     String
+  role             UserRole       @default(CUSTOMER)
+  walletBalance    Float          @default(0)
+  rewardPoints     Int            @default(0)
+  referralCode     String         @unique
+  savedUid         String?
+  savedPlayerName  String?
+  savedServer      GameServer     @default(BD)
+  isActive         Boolean        @default(true)
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  orders           Order[]
+  transactions     Transaction[]
+  notifications    Notification[]
+  auditLogs        AuditLog[]
+  referralsGiven   Referral[]     @relation("ReferrerUser")
+  referralReceived Referral?      @relation("ReferredUser")
+
+  @@index([email])
+  @@index([phone])
+  @@index([referralCode])
+}
+
+// ============================================================================
+// 2. CATEGORY MODEL
+// ============================================================================
+
+model Category {
+  id           String    @id @default(uuid())
+  name         String
+  slug         String    @unique
+  description  String?
+  badgeText    String?
+  displayOrder Int       @default(0)
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  products     Product[]
+
+  @@index([slug])
+  @@index([isActive, displayOrder])
+}
+
+// ============================================================================
+// 3. PRODUCT MODEL (Dynamic Diamond & Membership Packages)
+// ============================================================================
+
+model Product {
+  id              String              @id @default(uuid())
+  sku             String              @unique
+  name            String
+  slug            String              @unique
+  categoryId      String
+  diamondQuantity Int                 @default(0)
+  bonusDiamonds   Int                 @default(0)
+  purchasePrice   Float
+  sellingPrice    Float
+  discount        Float               @default(0)
+  imageUrl        String              @default("/images/diamond-pack.png")
+  tag             String?
+  isPopular       Boolean             @default(false)
+  availability    ProductAvailability @default(IN_STOCK)
+  isActive        Boolean             @default(true)
+  displayOrder    Int                 @default(0)
+  supplierCode    String?
+  description     String?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  category        Category            @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  orderItems      OrderItem[]
+
+  @@index([categoryId])
+  @@index([isActive, availability, displayOrder])
+  @@index([slug])
+}
+
+// ============================================================================
+// 4. COUPON MODEL
+// ============================================================================
+
+model Coupon {
+  id             String       @id @default(uuid())
+  code           String       @unique
+  description    String?
+  discountType   DiscountType @default(FIXED)
+  discountValue  Float
+  minOrderAmount Float        @default(0)
+  maxDiscount    Float?
+  maxUses        Int          @default(100)
+  usedCount      Int          @default(0)
+  expiresAt      DateTime?
+  isActive       Boolean      @default(true)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  orders         Order[]
+
+  @@index([code, isActive])
+}
+
+// ============================================================================
+// 5. ORDER MODEL (Supports both Logged-in & Guest Customers)
+// ============================================================================
+
+model Order {
+  id             String         @id @default(uuid())
+  orderNumber    String         @unique // Format: FFH-20261124-000001
+  userId         String?
+  guestPhone     String?
+  guestEmail     String?
+  playerUid      String
+  playerName     String
+  server         GameServer     @default(BD)
+  subtotal       Float
+  discountAmount Float          @default(0)
+  totalAmount    Float
+  couponId       String?
+  paymentMethod  PaymentMethod
+  paymentStatus  PaymentStatus  @default(UNPAID)
+  orderStatus    OrderStatus    @default(PENDING)
+  idempotencyKey String?        @unique
+  customerNote   String?
+  adminNote      String?
+  ipAddress      String?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  user           User?          @relation(fields: [userId], references: [id], onDelete: SetNull)
+  coupon         Coupon?        @relation(fields: [couponId], references: [id], onDelete: SetNull)
+  items          OrderItem[]
+  payment        Payment?
+  delivery       Delivery?
+  transactions   Transaction[]
+  notifications  Notification[]
+
+  @@index([orderNumber])
+  @@index([playerUid])
+  @@index([userId])
+  @@index([orderStatus, paymentStatus])
+  @@index([createdAt])
+}
+
+// ============================================================================
+// 6. ORDER ITEM MODEL
+// ============================================================================
+
+model OrderItem {
+  id              String   @id @default(uuid())
+  orderId         String
+  productId       String
+  productName     String
+  diamondQuantity Int      @default(0)
+  bonusDiamonds   Int      @default(0)
+  quantity        Int      @default(1)
+  purchasePrice   Float
+  unitPrice       Float
+  discount        Float    @default(0)
+  totalPrice      Float
+  createdAt       DateTime @default(now())
+
+  order           Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product         Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([orderId])
+  @@index([productId])
+}
+
+// ============================================================================
+// 7. PAYMENT MODEL (Strict Duplicate TrxID Prevention)
+// ============================================================================
+
+model Payment {
+  id                   String        @id @default(uuid())
+  orderId              String        @unique
+  method               PaymentMethod
+  merchantNumber       String
+  senderNumber         String
+  transactionReference String        @unique // Duplicate TrxID Prevention Constraint
+  amount               Float
+  status               PaymentStatus @default(UNDER_REVIEW)
+  paymentInstructions  String?
+  verifiedBy           String?
+  verifiedAt           DateTime?
+  rejectionReason      String?
+  submittedAt          DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+
+  order                Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  transactions         Transaction[]
+
+  @@index([transactionReference])
+  @@index([senderNumber])
+  @@index([status])
+}
+
+// ============================================================================
+// 8. TRANSACTION MODEL (Financial Ledger)
+// ============================================================================
+
+model Transaction {
+  id          String            @id @default(uuid())
+  userId      String?
+  orderId     String?
+  paymentId   String?
+  type        TransactionType
+  amount      Float
+  status      TransactionStatus @default(PENDING)
+  reference   String            @unique
+  description String
+  metadata    Json?
+  createdAt   DateTime          @default(now())
+
+  user        User?             @relation(fields: [userId], references: [id], onDelete: SetNull)
+  order       Order?            @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  payment     Payment?          @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([orderId])
+  @@index([reference])
+}
+
+// ============================================================================
+// 9. SUPPLIER MODEL (Modular Diamond Supplier Config)
+// ============================================================================
+
+model Supplier {
+  id          String     @id @default(uuid())
+  name        String
+  code        String     @unique
+  baseUrl     String?
+  isActive    Boolean    @default(true)
+  isDemoMode  Boolean    @default(true)
+  priority    Int        @default(1)
+  timeoutMs   Int        @default(15000)
+  maxRetries  Int        @default(3)
+  configJson  Json?
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  deliveries  Delivery[]
+
+  @@index([code, isActive])
+}
+
+// ============================================================================
+// 10. DELIVERY MODEL (Automatic Diamond Delivery & Retry Queue)
+// ============================================================================
+
+model Delivery {
+  id                  String         @id @default(uuid())
+  orderId             String         @unique // Prevents Duplicate Delivery for the same Order
+  supplierId          String
+  status              DeliveryStatus @default(QUEUED)
+  isDemo              Boolean        @default(true)
+  deliveryReferenceId String?        @unique
+  attemptCount        Int            @default(0)
+  maxAttempts         Int            @default(3)
+  nextRetryAt         DateTime?
+  requestPayload      Json?
+  responsePayload     Json?
+  errorCode           String?
+  errorMessage        String?
+  deliveredAt         DateTime?
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  order               Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  supplier            Supplier       @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+
+  @@index([status, nextRetryAt])
+  @@index([orderId])
+  @@index([deliveryReferenceId])
+}
+
+// ============================================================================
+// 11. REFERRAL MODEL
+// ============================================================================
+
+model Referral {
+  id               String         @id @default(uuid())
+  referrerId       String
+  referredUserId   String         @unique
+  referralCodeUsed String
+  rewardPoints     Int            @default(50)
+  status           ReferralStatus @default(PENDING)
+  createdAt        DateTime       @default(now())
+  completedAt      DateTime?
+
+  referrer         User           @relation("ReferrerUser", fields: [referrerId], references: [id], onDelete: Cascade)
+  referredUser     User           @relation("ReferredUser", fields: [referredUserId], references: [id], onDelete: Cascade)
+
+  @@index([referrerId])
+}
+
+// ============================================================================
+// 12. AUDIT LOG MODEL (Security & Admin Activity Tracking)
+// ============================================================================
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  userId     String?
+  action     String
+  entityType String
+  entityId   String?
+  ipAddress  String?
+  userAgent  String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId])
+  @@index([userId])
+  @@index([createdAt])
+}
+
+// ============================================================================
+// 13. NOTIFICATION MODEL
+// ============================================================================
+
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String?
+  orderId   String?
+  title     String
+  message   String
+  type      String   @default("ORDER_UPDATE")
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user      User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  order     Order?   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRead])
+  @@index([orderId])
+}
