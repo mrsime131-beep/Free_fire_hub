@@ -1,59 +1,75 @@
-import { Router } from "express";
-import {
-  triggerOrRetryDelivery,
-  getDeliveryStatus,
-  getAllDeliveries,
-} from "../controllers/delivery.controller.js";
-import {
-  optionalAuth,
+const express = require('express');
+const router = express.Router();
+
+const {
+  authenticate,
   requireAdmin,
-} from "../middlewares/auth.middleware.js";
-import { validate } from "../middlewares/validate.middleware.js";
-import { orderNumberParamSchema } from "../validators/order.validator.js";
+} = require('../middlewares/auth.middleware');
+const { validateOrderIdParam } = require('../middlewares/validate.middleware');
 
-const router = Router();
+const {
+  getDeliveryDetailsHandler,
+  processOrderDeliveryHandler,
+  getOrderRetryHistoryHandler,
+  manualRetryDeliveryHandler,
+  processRetryQueueHandler,
+  getDeliveryLogsHandler,
+} = require('../controllers/delivery.controller');
+
+// ডেলিভারি ইঞ্জিন ও সাপ্লায়ার লগ নিয়ন্ত্রণের প্রতিটি রাউটে অ্যাডমিন অথেনটিকেশন বাধ্যতামূলক
+router.use(authenticate, requireAdmin);
 
 /**
- * @route   GET /api/deliveries
- * @desc    অ্যাডমিন প্যানেলের জন্য সকল ডায়মন্ড ডেলিভারি লগ, স্ট্যাটাস ফিল্টারিং এবং পেজিনেশন
- * @access  Private (Admin Only)
+ * ১. সব সাপ্লায়ার ডেলিভারি অ্যাটেম্পট লগ দেখা (ফিল্টার ও পেজিনেশনসহ)
+ * GET /api/delivery/logs
+ * (নোট: ডাইনামিক /:orderId রাউটের উপরে রাখা হয়েছে যেন Express 'logs'-কে orderId মনে না করে)
  */
-router.get("/", requireAdmin, getAllDeliveries);
+router.get('/logs', getDeliveryLogsHandler);
 
 /**
- * @route   GET /api/deliveries/:orderNumber
- * @desc    নির্দিষ্ট Order Number (যেমন: FFH-20261124-000001) বা Order UUID দিয়ে ডেলিভারি স্ট্যাটাস ট্র্যাক করা
- * @access  Public / Optional Auth
+ * ২. রিট্রাই কিউতে অপেক্ষমাণ (RETRY_PENDING) অর্ডারগুলো ব্যাচ আকারে প্রসেস করা
+ * POST /api/delivery/retry-queue/process
+ */
+router.post('/retry-queue/process', processRetryQueueHandler);
+
+/**
+ * ৩. নির্দিষ্ট অর্ডারের ডেলিভারি স্ট্যাটাস ও সাপ্লায়ার অ্যাটেম্পট বিবরণ দেখা
+ * GET /api/delivery/:orderId
  */
 router.get(
-  "/:orderNumber",
-  optionalAuth,
-  validate({ params: orderNumberParamSchema }),
-  getDeliveryStatus
+  '/:orderId',
+  validateOrderIdParam,
+  getDeliveryDetailsHandler
 );
 
 /**
- * @route   POST /api/deliveries/:orderNumber/trigger
- * @desc    পেমেন্ট VERIFIED থাকা কোনো অর্ডারের ডায়মন্ড ডেলিভারি ম্যানুয়ালি ট্রিগার করা
- * @access  Private (Admin Only)
+ * ৪. ভেরিফাইড পেমেন্টের অর্ডারের জন্য অটোমেটিক ডেলিভারি ইঞ্জিন ট্রিগার করা
+ * POST /api/delivery/:orderId/process
  */
 router.post(
-  "/:orderNumber/trigger",
-  requireAdmin,
-  validate({ params: orderNumberParamSchema }),
-  triggerOrRetryDelivery
+  '/:orderId/process',
+  validateOrderIdParam,
+  processOrderDeliveryHandler
 );
 
 /**
- * @route   POST /api/deliveries/:orderNumber/retry
- * @desc    পূর্বে FAILED হওয়া কোনো ডায়মন্ড ডেলিভারি ওয়ান-ক্লিকে পুনরায় চেষ্টা (Retry) করা
- * @access  Private (Admin Only)
+ * ৫. নির্দিষ্ট অর্ডারের রিট্রাই সামারি ও সাপ্লায়ার এরর হিস্ট্রি দেখা
+ * GET /api/delivery/:orderId/retries
  */
-router.post(
-  "/:orderNumber/retry",
-  requireAdmin,
-  validate({ params: orderNumberParamSchema }),
-  triggerOrRetryDelivery
+router.get(
+  '/:orderId/retries',
+  validateOrderIdParam,
+  getOrderRetryHistoryHandler
 );
 
-export default router;
+/**
+ * ৬. ব্যর্থ ডেলিভারির জন্য অ্যাডমিন কর্তৃক ম্যানুয়াল রিট্রাই অনুমোদন ও এক্সিকিউট করা
+ * POST /api/delivery/:orderId/retry
+ */
+router.post(
+  '/:orderId/retry',
+  validateOrderIdParam,
+  manualRetryDeliveryHandler
+);
+
+module.exports = router;
