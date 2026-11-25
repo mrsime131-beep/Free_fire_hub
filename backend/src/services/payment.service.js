@@ -1,473 +1,610 @@
-import { prisma } from "../config/db.js";
-import { ApiError } from "../utils/apiResponse.js";
-import { logger } from "../utils/logger.js";
-import { logAuditEvent } from "./audit.service.js";
-import { formatOrderResponse } from "./order.service.js";
-import { executeOrderDelivery } from "./delivery.service.js";
+const prisma = require('../config/prisma');
+const env = require('../config/env');
+const { AppError } = require('../middlewares/error.middleware');
+const {
+  ORDER_STATUS,
+  PAYMENT_STATUS,
+  DELIVERY_STATUS,
+  assertValidStatusTransition,
+  buildStatusHistoryPayload,
+} = require('../utils/stateMachine');
+const { createAuditLog, logAdminOrderAction } = require('./audit.service');
+const {
+  notifyPaymentSubmitted,
+  notifyPaymentVerified,
+  notifyPaymentRejected,
+} = require('./notification.service');
+const { processOrderDelivery } = require('./delivery/delivery.engine');
+const { buildFiveStepTrackingTimeline } = require('./order.service');
 
 /**
- * অর্ডার নম্বর (FFH-20261124-000001), Order UUID অথবা Payment UUID দিয়ে অর্ডার ও পেমেন্ট রেকর্ড খুঁজে বের করার হেল্পার
+ * ১. কাস্টমারের চেকআউট পেজের জন্য বিকাশ/নগদ/রকেট পেমেন্ট নাম্বার ও নিরাপত্তা নির্দেশনা
  */
-async function findOrderWithPayment(identifier) {
-  const cleanId = String(identifier).trim();
+const getPaymentInstructions = () => {
+  return {
+    currency: 'BDT',
+    supportWhatsapp: env.SUPPORT_WHATSAPP || '01623759878',
+    securityWarning:
+      'নিরাপত্তা সতর্কবার্তা: আমরা শুধুমাত্র আপনার পেমেন্টের Transaction ID (TrxID) এবং Sender Number গ্রহণ করি। কখনোই আপনার বিকাশ/নগদ/রকেটের PIN বা OTP কারো সাথে শেয়ার করবেন না।',
+    methods: [
+      {
+        code: 'BKASH',
+        name: 'bKash (Personal / Send Money)',
+        accountNumber: env.BKASH_NUMBER || '01623759878',
+        accountType: 'Personal',
+        isActive: true,
+        instructions: [
+          '১. আপনার বিকাশ অ্যাপ বা *247# ডায়াল করে Send Money অপশনে যান।',
+          `২. প্রাপক নাম্বার হিসেবে ${env.BKASH_NUMBER || '01623759878'} দিন এবং অর্ডারের নির্ধারিত টাকার পরিমাণ লিখুন।`,
+          '৩. রেফারেন্সে আপনার Order ID লিখুন এবং পেমেন্ট সম্পন্ন করুন।',
+          '৪. ফিরতি মেসেজ থেকে পাওয়া Transaction ID (TrxID) এবং যে নাম্বার থেকে টাকা পাঠিয়েছেন তা নিচের ফর্মে জমা দিন।',
+        ],
+      },
+      {
+        code: 'NAGAD',
+        name: 'Nagad (Personal / Send Money)',
+        accountNumber: env.NAGAD_NUMBER || '01623759878',
+        accountType: 'Personal',
+        isActive: true,
+        instructions: [
+          '১. আপনার নগদ অ্যাপ বা *167# ডায়াল করে Send Money অপশনে যান।',
+          `২. প্রাপক নাম্বার হিসেবে ${env.NAGAD_NUMBER || '01623759878'} দিন এবং নির্ধারিত টাকা পাঠান।`,
+          '৩. পেমেন্ট সফল হলে মেসেজ থেকে পাওয়া TrxID ও আপনার নগদ নাম্বারটি নিচে সাবমিট করুন।',
+        ],
+      },
+      {
+        code: 'ROCKET',
+        name: 'Rocket (Personal / Send Money)',
+        accountNumber: env.ROCKET_NUMBER || '01623759878',
+        accountType: 'Personal',
+        isActive: true,
+        instructions: [
+          '১. রকেট অ্যাপ বা *322# থেকে Send Money অপশনে গিয়ে নির্ধারিত টাকা পাঠান।',
+          '২. ট্রানজেকশন সম্পন্ন হলে TrxID এবং সেন্ডার নাম্বার জমা দিন।',
+        ],
+      },
+    ],
+  };
+};
+
+/**
+ * ২. কাস্টমার কর্তৃক ম্যানুয়াল পেমেন্ট (TrxID ও Sender Number) সাবমিশন (POST /api/orders/:orderId/payment)
+ */
+const submitManualPayment = async ({
+  orderIdentifier,
+  validatedPayment,
+  user = null,
+  guestId = null,
+  req = null,
+}) => {
+  const {
+    transactionReference,
+    senderNumber,
+    paymentMethod,
+    paidAmount,
+    proofUrl,
+  } = validatedPayment;
+
+  const cleanOrderId = String(orderIdentifier || '').trim();
 
   const order = await prisma.order.findFirst({
     where: {
-      OR: [
-        { orderNumber: cleanId.toUpperCase() },
-        { id: cleanId },
-        { payment: { id: cleanId } },
-      ],
+      OR: [{ id: cleanOrderId }, { orderNumber: cleanOrderId.toUpperCase() }],
     },
     include: {
-      items: true,
       payment: true,
       delivery: true,
     },
   });
 
   if (!order) {
-    throw new ApiError(
+    throw new AppError(
+      'পেমেন্ট জমা দেওয়ার জন্য অর্ডারটি খুঁজে পাওয়া যায়নি।',
       404,
-      `অর্ডার বা পেমেন্ট রেকর্ড ('${cleanId}') খুঁজে পাওয়া যায়নি।`,
-      null,
-      "ORDER_OR_PAYMENT_NOT_FOUND"
+      'ORDER_NOT_FOUND'
     );
   }
 
-  return order;
-}
-
-/**
- * ১. কাস্টমারের বিকাশ/নগদ/রকেট পেমেন্ট তথ্য (Sender Number ও TrxID) জমা নেওয়ার সার্ভিস
- * - ডুপ্লিকেট Transaction ID (TrxID) কঠোরভাবে ব্লক করবে
- * - আগে রিজেক্ট হওয়া পেমেন্টে সঠিক TrxID দিয়ে পুনরায় সাবমিট করার সুযোগ দেবে
- */
-export async function submitOrderPayment(orderIdentifier, payload, req = null) {
-  const targetId = orderIdentifier || payload.orderIdentifier;
-
-  if (!targetId) {
-    throw new ApiError(
+  // নিরাপত্তা চেক ১: অর্ডার ইতিমধ্যে COMPLETED, CANCELLED বা REFUNDED হলে নতুন পেমেন্ট নেওয়া হবে না
+  if (
+    [
+      ORDER_STATUS.COMPLETED,
+      ORDER_STATUS.CANCELLED,
+      ORDER_STATUS.REFUNDED,
+    ].includes(order.orderStatus)
+  ) {
+    throw new AppError(
+      `এই অর্ডারটি ইতিমধ্যে ${order.orderStatus} অবস্থায় রয়েছে। এতে নতুন পেমেন্ট তথ্য জমা দেওয়া সম্ভব নয়।`,
       400,
-      "পেমেন্ট জমা দেওয়ার জন্য Order Number অবশ্যই দিতে হবে।",
-      null,
-      "ORDER_NUMBER_REQUIRED"
+      'ORDER_TERMINATED_PAYMENT_BLOCKED'
     );
   }
 
-  const order = await findOrderWithPayment(targetId);
+  // নিরাপত্তা চেক ২: পেমেন্ট ইতিমধ্যে VERIFIED হয়ে থাকলে পুনরায় সাবমিট ব্লক করা
+  if (order.paymentStatus === PAYMENT_STATUS.VERIFIED) {
+    throw new AppError(
+      'এই অর্ডারের পেমেন্ট ইতিমধ্যে ভেরিফাই (VERIFIED) করা হয়েছে।',
+      409,
+      'PAYMENT_ALREADY_VERIFIED'
+    );
+  }
 
-  // ১. অর্ডার ইতিমধ্যে সম্পন্ন বা বাতিল হয়ে থাকলে নতুন পেমেন্ট নেওয়া যাবে না
-  if (["COMPLETED", "CANCELLED", "REFUNDED"].includes(order.orderStatus)) {
-    throw new ApiError(
+  // নিরাপত্তা চেক ৩: প্রদত্ত টাকার পরিমাণ অর্ডারের নির্ধারিত মূল্যের চেয়ে কম হলে ব্লক করা
+  const requiredAmount = Number(order.finalPayableAmount);
+  if (
+    paidAmount !== null &&
+    paidAmount !== undefined &&
+    Number(paidAmount) < requiredAmount
+  ) {
+    throw new AppError(
+      `অপর্যাপ্ত পেমেন্ট অ্যামাউন্ট! অর্ডারের প্রদেয় মূল্য ৳${requiredAmount}, কিন্তু উল্লেখ করা হয়েছে ৳${paidAmount}।`,
       400,
-      `এই অর্ডারটি ইতিমধ্যে ${order.orderStatus} অবস্থায় রয়েছে। এতে নতুন পেমেন্ট সাবমিট করা যাবে না।`,
-      null,
-      "INVALID_ORDER_STATE_FOR_PAYMENT"
+      'INSUFFICIENT_PAYMENT_AMOUNT'
     );
   }
 
-  if (order.paymentStatus === "VERIFIED") {
-    throw new ApiError(
-      400,
-      "এই অর্ডারের পেমেন্ট ইতিমধ্যে ভেরিফাই (VERIFIED) করা হয়েছে।",
-      null,
-      "PAYMENT_ALREADY_VERIFIED"
-    );
-  }
-
-  const cleanTrxId = String(payload.transactionReference).trim().toUpperCase();
-  const cleanSenderNumber = String(payload.senderNumber).trim();
-  const resolvedPaymentMethod = payload.paymentMethod || order.paymentMethod;
-
-  // ২. ডুপ্লিকেট TrxID চেক: অন্য কোনো অর্ডারে এই TrxID ব্যবহৃত হয়েছে কি না তা যাচাই করা
-  const existingTrxPayment = await prisma.payment.findUnique({
-    where: { transactionReference: cleanTrxId },
-    select: { id: true, orderId: true },
+  // নিরাপত্তা চেক ৪: একই TrxID অন্য কোনো অর্ডারে আগে ব্যবহৃত হয়েছে কি না তা যাচাই করা
+  const duplicateTrx = await prisma.payment.findFirst({
+    where: {
+      transactionReference,
+      NOT: {
+        orderId: order.id,
+      },
+    },
+    select: {
+      id: true,
+      orderId: true,
+    },
   });
 
-  if (existingTrxPayment && existingTrxPayment.orderId !== order.id) {
-    logger.warn(
-      `Blocked duplicate TrxID submission: ${cleanTrxId} on Order ${order.orderNumber}`,
-      { existingOrderId: existingTrxPayment.orderId },
-      "PAYMENT_SECURITY"
-    );
-    throw new ApiError(
+  if (duplicateTrx) {
+    throw new AppError(
+      'এই Transaction ID (TrxID) ইতিমধ্যে অন্য একটি অর্ডারে ব্যবহার করা হয়েছে। অনুগ্রহ করে সঠিক TrxID প্রদান করুন।',
       409,
-      "এই Transaction ID (TrxID) ইতিমধ্যে অন্য একটি অর্ডারে ব্যবহৃত হয়েছে। অনুগ্রহ করে সঠিক এবং নতুন TrxID দিন।",
-      null,
-      "DUPLICATE_TRANSACTION_ID"
+      'DUPLICATE_TRANSACTION_REFERENCE'
     );
   }
 
+  // স্টেট মেশিন ট্রানজিশন যাচাই
+  const targetOrderStatus = ORDER_STATUS.PAYMENT_REVIEW;
+  const targetPaymentStatus = PAYMENT_STATUS.SUBMITTED;
+
+  assertValidStatusTransition({
+    currentOrderStatus: order.orderStatus,
+    currentPaymentStatus: order.paymentStatus,
+    currentDeliveryStatus: order.deliveryStatus,
+    nextOrderStatus: targetOrderStatus,
+    nextPaymentStatus: targetPaymentStatus,
+    nextDeliveryStatus: order.deliveryStatus,
+  });
+
+  const resolvedMethod = paymentMethod || order.paymentMethod;
   const now = new Date();
 
-  // ৩. Atomic Transaction-এ Payment এবং Order স্ট্যাটাস আপডেট করা
-  const updatedOrder = await prisma.$transaction(async (tx) => {
-    await tx.payment.upsert({
+  const updatedResult = await prisma.$transaction(async (tx) => {
+    const updatedPayment = await tx.payment.upsert({
       where: { orderId: order.id },
-      create: {
-        orderId: order.id,
-        paymentMethod: resolvedPaymentMethod,
-        amount: order.payableAmount,
-        senderNumber: cleanSenderNumber,
-        transactionReference: cleanTrxId,
-        status: "UNDER_REVIEW",
-        submittedAt: now,
-      },
       update: {
-        paymentMethod: resolvedPaymentMethod,
-        senderNumber: cleanSenderNumber,
-        transactionReference: cleanTrxId,
-        status: "UNDER_REVIEW",
+        method: resolvedMethod,
+        status: targetPaymentStatus,
+        senderNumber,
+        transactionReference,
+        proofUrl: proofUrl || order.payment?.proofUrl || null,
         rejectionReason: null,
         submittedAt: now,
       },
+      create: {
+        orderId: order.id,
+        method: resolvedMethod,
+        status: targetPaymentStatus,
+        amount: order.finalPayableAmount,
+        currency: order.currency || 'BDT',
+        senderNumber,
+        transactionReference,
+        proofUrl: proofUrl || null,
+        submittedAt: now,
+      },
     });
 
-    return tx.order.update({
+    const updatedOrder = await tx.order.update({
       where: { id: order.id },
       data: {
-        paymentMethod: resolvedPaymentMethod,
-        paymentStatus: "UNDER_REVIEW",
-        orderStatus: "PAYMENT_REVIEW",
-        guestPhone: order.guestPhone || cleanSenderNumber,
+        paymentMethod: resolvedMethod,
+        paymentReference: transactionReference,
+        orderStatus: targetOrderStatus,
+        paymentStatus: targetPaymentStatus,
       },
       include: {
-        items: true,
         payment: true,
         delivery: true,
       },
     });
+
+    await tx.orderStatusHistory.create({
+      data: buildStatusHistoryPayload({
+        orderId: order.id,
+        previousOrderStatus: order.orderStatus,
+        newOrderStatus: targetOrderStatus,
+        previousPaymentStatus: order.paymentStatus,
+        newPaymentStatus: targetPaymentStatus,
+        previousDeliveryStatus: order.deliveryStatus,
+        newDeliveryStatus: order.deliveryStatus,
+        changedBy: user?.email || (guestId ? `GUEST:${guestId}` : 'CUSTOMER'),
+        reason: `Customer submitted ${resolvedMethod} payment reference (${transactionReference}).`,
+        metadata: {
+          paymentMethod: resolvedMethod,
+          senderNumber,
+          transactionReference,
+        },
+      }),
+    });
+
+    await createAuditLog(
+      {
+        actor: user,
+        actorEmail: user?.email || order.customerEmail || 'CUSTOMER',
+        actorRole: user?.role || 'CUSTOMER',
+        action: 'PAYMENT_SUBMITTED',
+        entityType: 'PAYMENT',
+        entityId: updatedPayment.id,
+        orderId: order.id,
+        previousState: {
+          orderStatus: order.orderStatus,
+          paymentStatus: order.paymentStatus,
+          paymentReference: order.paymentReference,
+        },
+        newState: {
+          orderStatus: targetOrderStatus,
+          paymentStatus: targetPaymentStatus,
+          paymentReference: transactionReference,
+          senderNumber,
+        },
+        req,
+      },
+      tx
+    );
+
+    return {
+      order: updatedOrder,
+      payment: updatedPayment,
+    };
   });
 
-  await logAuditEvent({
-    req,
-    userId: req?.user?.id || order.userId || null,
-    action: "PAYMENT_SUBMITTED",
-    entityType: "PAYMENT",
-    entityId: updatedOrder.orderNumber,
-    metadata: {
-      orderId: updatedOrder.id,
-      orderNumber: updatedOrder.orderNumber,
-      paymentMethod: resolvedPaymentMethod,
-      senderNumber: cleanSenderNumber,
-      transactionReference: cleanTrxId,
-      amount: updatedOrder.payableAmount,
+  // অ্যাডমিন এবং কাস্টমারকে নোটিফিকেশন পাঠানো
+  await notifyPaymentSubmitted(updatedResult.order, updatedResult.payment);
+
+  return {
+    order: updatedResult.order,
+    payment: updatedResult.payment,
+    timeline: buildFiveStepTrackingTimeline(updatedResult.order),
+  };
+};
+
+/**
+ * ৩. অ্যাডমিন কর্তৃক পেমেন্ট ভেরিফিকেশন (VERIFIED) অথবা রিজেকশন (REJECTED)
+ * পেমেন্ট VERIFIED হলে স্বয়ংক্রিয়ভাবে ডায়মন্ড ডেলিভারি ইঞ্জিন ট্রিগার করে (Part 4 & Part 5)।
+ */
+const verifyOrRejectPayment = async ({
+  orderIdentifier,
+  decisionStatus,
+  reason = null,
+  autoTriggerDelivery = true,
+  adminUser,
+  req = null,
+}) => {
+  const cleanOrderId = String(orderIdentifier || '').trim();
+
+  const order = await prisma.order.findFirst({
+    where: {
+      OR: [{ id: cleanOrderId }, { orderNumber: cleanOrderId.toUpperCase() }],
+    },
+    include: {
+      payment: true,
+      delivery: true,
     },
   });
 
-  logger.info(
-    `Payment submitted for Order ${updatedOrder.orderNumber} — Method: ${resolvedPaymentMethod}, TrxID: ${cleanTrxId}`,
-    null,
-    "PAYMENT_SERVICE"
-  );
-
-  return formatOrderResponse(updatedOrder, req?.user?.role === "ADMIN");
-}
-
-/**
- * ২. অ্যাডমিনের মাধ্যমে পেমেন্ট ভেরিফিকেশন সার্ভিস (VERIFIED / REJECTED / REFUNDED)
- * - পেমেন্ট VERIFIED হওয়ার সাথে সাথে স্বয়ংক্রিয়ভাবে executeOrderDelivery() কল করে ডায়মন্ড ডেলিভারি সম্পন্ন করবে।
- */
-export async function verifyOrderPaymentByAdmin(identifier, payload, req = null) {
-  const {
-    status,
-    rejectionReason = null,
-    adminNote,
-    autoDeliver = true,
-  } = payload;
-
-  const order = await findOrderWithPayment(identifier);
-
-  if (!order.payment) {
-    throw new ApiError(
-      400,
-      "এই অর্ডারের কোনো পেমেন্ট রেকর্ড পাওয়া যায়নি।",
-      null,
-      "PAYMENT_RECORD_MISSING"
+  if (!order) {
+    throw new AppError(
+      'পেমেন্ট যাচাই করার জন্য অর্ডারটি খুঁজে পাওয়া যায়নি।',
+      404,
+      'ORDER_NOT_FOUND'
     );
   }
 
-  // যদি ইতিমধ্যে VERIFIED এবং DELIVERED হয়ে থাকে, তবে পুনরায় ভেরিফাই না করে বর্তমান স্ট্যাটাস রিটার্ন করা
+  // যদি ডেলিভারি ইতিমধ্যে COMPLETED হয়ে থাকে, তবে পেমেন্ট স্ট্যাটাস পরিবর্তন বা রিজেক্ট করা যাবে না
   if (
-    status === "VERIFIED" &&
-    order.paymentStatus === "VERIFIED" &&
-    order.orderStatus === "COMPLETED"
+    order.orderStatus === ORDER_STATUS.COMPLETED ||
+    order.deliveryStatus === DELIVERY_STATUS.COMPLETED
   ) {
-    return formatOrderResponse(order, true);
+    throw new AppError(
+      'এই অর্ডারটির ডায়মন্ড ডেলিভারি ইতিমধ্যে সম্পন্ন হয়েছে। এর পেমেন্ট স্ট্যাটাস পরিবর্তন করা যাবে না।',
+      409,
+      'ORDER_ALREADY_COMPLETED'
+    );
   }
 
-  const now = new Date();
-  const adminUserId = req?.user?.id || null;
+  // কেস ১: অ্যাডমিন পেমেন্ট REJECTED করলে
+  if (decisionStatus === PAYMENT_STATUS.REJECTED) {
+    const targetOrderStatus = ORDER_STATUS.PAYMENT_REVIEW;
+    const targetPaymentStatus = PAYMENT_STATUS.REJECTED;
 
-  // ক) যদি অ্যাডমিন পেমেন্ট VERIFIED করেন
-  if (status === "VERIFIED") {
-    if (!order.payment.transactionReference) {
-      throw new ApiError(
-        400,
-        "Transaction ID (TrxID) ছাড়া পেমেন্ট VERIFIED করা যাবে না।",
-        null,
-        "TRX_ID_MISSING_FOR_VERIFICATION"
-      );
-    }
+    assertValidStatusTransition({
+      currentOrderStatus: order.orderStatus,
+      currentPaymentStatus: order.paymentStatus,
+      currentDeliveryStatus: order.deliveryStatus,
+      nextOrderStatus: targetOrderStatus,
+      nextPaymentStatus: targetPaymentStatus,
+      nextDeliveryStatus: order.deliveryStatus,
+    });
 
-    const verifiedOrder = await prisma.$transaction(async (tx) => {
-      await tx.payment.update({
-        where: { id: order.payment.id },
-        data: {
-          status: "VERIFIED",
-          rejectionReason: null,
-          verifiedBy: adminUserId,
-          verifiedAt: now,
+    const rejectedResult = await prisma.$transaction(async (tx) => {
+      const updatedPayment = await tx.payment.upsert({
+        where: { orderId: order.id },
+        update: {
+          status: targetPaymentStatus,
+          verifiedBy: adminUser?.id || null,
+          rejectionReason: reason,
+          reviewNotes: reason,
+        },
+        create: {
+          orderId: order.id,
+          method: order.paymentMethod,
+          status: targetPaymentStatus,
+          amount: order.finalPayableAmount,
+          verifiedBy: adminUser?.id || null,
+          rejectionReason: reason,
+          reviewNotes: reason,
         },
       });
 
-      return tx.order.update({
+      const updatedOrder = await tx.order.update({
         where: { id: order.id },
         data: {
-          paymentStatus: "VERIFIED",
-          orderStatus: "PAID",
-          ...(adminNote !== undefined ? { adminNote } : {}),
+          orderStatus: targetOrderStatus,
+          paymentStatus: targetPaymentStatus,
         },
         include: {
-          items: true,
           payment: true,
           delivery: true,
         },
       });
-    });
 
-    await logAuditEvent({
-      req,
-      userId: adminUserId,
-      action: "PAYMENT_VERIFIED",
-      entityType: "PAYMENT",
-      entityId: verifiedOrder.orderNumber,
-      metadata: {
-        orderId: verifiedOrder.id,
-        orderNumber: verifiedOrder.orderNumber,
-        transactionReference: verifiedOrder.payment.transactionReference,
-        amount: verifiedOrder.payableAmount,
-        autoDeliver,
-      },
-    });
+      await tx.orderStatusHistory.create({
+        data: buildStatusHistoryPayload({
+          orderId: order.id,
+          previousOrderStatus: order.orderStatus,
+          newOrderStatus: targetOrderStatus,
+          previousPaymentStatus: order.paymentStatus,
+          newPaymentStatus: targetPaymentStatus,
+          previousDeliveryStatus: order.deliveryStatus,
+          newDeliveryStatus: order.deliveryStatus,
+          changedBy: adminUser?.email || 'ADMIN',
+          reason: `Payment rejected by Admin. Reason: ${reason}`,
+        }),
+      });
 
-    logger.info(
-      `Payment VERIFIED by Admin for Order ${verifiedOrder.orderNumber} (TrxID: ${verifiedOrder.payment.transactionReference})`,
-      null,
-      "PAYMENT_SERVICE"
-    );
-
-    // পেমেন্ট VERIFIED হওয়ার সাথে সাথে অটোমেটিক ডায়মন্ড ডেলিভারি ট্রিগার
-    if (autoDeliver) {
-      const deliveredOrder = await executeOrderDelivery(
-        verifiedOrder.orderNumber,
+      await logAdminOrderAction(
         {
+          adminUser,
+          action: 'PAYMENT_REJECTED',
+          order,
+          newState: {
+            orderStatus: targetOrderStatus,
+            paymentStatus: targetPaymentStatus,
+            rejectionReason: reason,
+          },
+          reason,
           req,
-          triggeredBy: "AUTO_ON_PAYMENT_VERIFIED",
-        }
+        },
+        tx
       );
-      return deliveredOrder;
+
+      return {
+        order: updatedOrder,
+        payment: updatedPayment,
+      };
+    });
+
+    await notifyPaymentRejected(rejectedResult.order, reason);
+
+    return {
+      decision: 'REJECTED',
+      deliveryTriggered: false,
+      order: rejectedResult.order,
+      payment: rejectedResult.payment,
+      timeline: buildFiveStepTrackingTimeline(rejectedResult.order),
+    };
+  }
+
+  // কেস ২: অ্যাডমিন পেমেন্ট VERIFIED (Approve) করলে
+  const trxRef =
+    order.payment?.transactionReference || order.paymentReference || null;
+
+  if (!trxRef) {
+    throw new AppError(
+      'কাস্টমার এখনো কোনো Transaction ID (TrxID) জমা দেননি। TrxID ছাড়া পেমেন্ট ভেরিফাই করা যাবে না।',
+      400,
+      'MISSING_TRANSACTION_REFERENCE'
+    );
+  }
+
+  // যদি আগে থেকেই পেমেন্ট VERIFIED হয়ে থাকে, তবে ডাবল ভেরিফিকেশন না করে ডেলিভারি বাকি থাকলে শুধু ডেলিভারি ট্রিগার করবে
+  if (order.paymentStatus === PAYMENT_STATUS.VERIFIED) {
+    if (
+      autoTriggerDelivery &&
+      order.deliveryStatus !== DELIVERY_STATUS.COMPLETED
+    ) {
+      const deliveryOutcome = await processOrderDelivery(order.id, {
+        triggeredBy: adminUser?.email || 'ADMIN_VERIFICATION',
+      });
+
+      const refreshedOrder = await prisma.order.findUnique({
+        where: { id: order.id },
+        include: { payment: true, delivery: true },
+      });
+
+      return {
+        decision: 'VERIFIED',
+        alreadyVerified: true,
+        deliveryTriggered: true,
+        deliveryOutcome,
+        order: refreshedOrder,
+        payment: refreshedOrder.payment,
+        timeline: buildFiveStepTrackingTimeline(refreshedOrder),
+      };
     }
 
-    return formatOrderResponse(verifiedOrder, true);
+    return {
+      decision: 'VERIFIED',
+      alreadyVerified: true,
+      deliveryTriggered: false,
+      order,
+      payment: order.payment,
+      timeline: buildFiveStepTrackingTimeline(order),
+    };
   }
 
-  // খ) যদি অ্যাডমিন পেমেন্ট REJECTED করেন
-  if (status === "REJECTED") {
-    const rejectedOrder = await prisma.$transaction(async (tx) => {
-      await tx.payment.update({
-        where: { id: order.payment.id },
-        data: {
-          status: "REJECTED",
-          rejectionReason:
-            rejectionReason || "ভুল Transaction ID অথবা পেমেন্ট পাওয়া যায়নি।",
-          verifiedBy: adminUserId,
-          verifiedAt: now,
-        },
-      });
+  const targetOrderStatus = ORDER_STATUS.PAYMENT_VERIFIED;
+  const targetPaymentStatus = PAYMENT_STATUS.VERIFIED;
+  const targetDeliveryStatus = DELIVERY_STATUS.QUEUED;
 
-      return tx.order.update({
-        where: { id: order.id },
-        data: {
-          paymentStatus: "REJECTED",
-          orderStatus: "FAILED",
-          ...(adminNote !== undefined ? { adminNote } : {}),
-        },
-        include: {
-          items: true,
-          payment: true,
-          delivery: true,
-        },
-      });
-    });
-
-    await logAuditEvent({
-      req,
-      userId: adminUserId,
-      action: "PAYMENT_REJECTED",
-      entityType: "PAYMENT",
-      entityId: rejectedOrder.orderNumber,
-      metadata: {
-        orderId: rejectedOrder.id,
-        orderNumber: rejectedOrder.orderNumber,
-        transactionReference: rejectedOrder.payment.transactionReference,
-        rejectionReason,
-      },
-    });
-
-    logger.warn(
-      `Payment REJECTED by Admin for Order ${rejectedOrder.orderNumber} — Reason: ${rejectionReason}`,
-      null,
-      "PAYMENT_SERVICE"
+  // যদি কাস্টমার UNPAID অবস্থায় থাকে কিন্তু TrxID থাকে, তবে সরাসরি VERIFIED করার অনুমতি
+  if (
+    order.paymentStatus !== PAYMENT_STATUS.SUBMITTED &&
+    order.paymentStatus !== PAYMENT_STATUS.VERIFYING
+  ) {
+    throw new AppError(
+      `বর্তমান পেমেন্ট স্ট্যাটাস (${order.paymentStatus}) থেকে সরাসরি VERIFIED করা যাবে না। আগে পেমেন্ট তথ্য SUBMITTED হতে হবে।`,
+      400,
+      'INVALID_PAYMENT_VERIFICATION_STATE'
     );
-
-    return formatOrderResponse(rejectedOrder, true);
   }
 
-  // গ) যদি অ্যাডমিন পেমেন্ট REFUNDED করেন
-  const refundedOrder = await prisma.$transaction(async (tx) => {
-    await tx.payment.update({
-      where: { id: order.payment.id },
+  assertValidStatusTransition({
+    currentOrderStatus: order.orderStatus,
+    currentPaymentStatus: order.paymentStatus,
+    currentDeliveryStatus: order.deliveryStatus,
+    nextOrderStatus: targetOrderStatus,
+    nextPaymentStatus: targetPaymentStatus,
+    nextDeliveryStatus: targetDeliveryStatus,
+  });
+
+  const verifiedAt = new Date();
+
+  const verifiedResult = await prisma.$transaction(async (tx) => {
+    const updatedPayment = await tx.payment.update({
+      where: { orderId: order.id },
       data: {
-        status: "REFUNDED",
-        verifiedBy: adminUserId,
-        verifiedAt: now,
+        status: targetPaymentStatus,
+        verifiedBy: adminUser?.id || null,
+        verifiedAt,
+        rejectionReason: null,
+        reviewNotes: reason || 'Verified by Admin',
       },
     });
 
-    return tx.order.update({
+    await tx.delivery.upsert({
+      where: { orderId: order.id },
+      update: {
+        status: targetDeliveryStatus,
+      },
+      create: {
+        orderId: order.id,
+        status: targetDeliveryStatus,
+        deliveryMode: env.DELIVERY_MODE === 'LIVE' ? 'LIVE' : 'DEMO',
+        attemptCount: 0,
+        maxRetries: env.MAX_DELIVERY_RETRIES || 3,
+      },
+    });
+
+    const updatedOrder = await tx.order.update({
       where: { id: order.id },
       data: {
-        paymentStatus: "REFUNDED",
-        orderStatus: "REFUNDED",
-        ...(adminNote !== undefined ? { adminNote } : {}),
+        orderStatus: targetOrderStatus,
+        paymentStatus: targetPaymentStatus,
+        deliveryStatus: targetDeliveryStatus,
       },
       include: {
-        items: true,
         payment: true,
         delivery: true,
       },
     });
+
+    await tx.orderStatusHistory.create({
+      data: buildStatusHistoryPayload({
+        orderId: order.id,
+        previousOrderStatus: order.orderStatus,
+        newOrderStatus: targetOrderStatus,
+        previousPaymentStatus: order.paymentStatus,
+        newPaymentStatus: targetPaymentStatus,
+        previousDeliveryStatus: order.deliveryStatus,
+        newDeliveryStatus: targetDeliveryStatus,
+        changedBy: adminUser?.email || 'ADMIN',
+        reason: reason || 'Payment verified by Admin. Queued for automatic delivery.',
+        metadata: {
+          transactionReference: trxRef,
+          verifiedBy: adminUser?.email || 'ADMIN',
+        },
+      }),
+    });
+
+    await logAdminOrderAction(
+      {
+        adminUser,
+        action: 'PAYMENT_VERIFIED',
+        order,
+        newState: {
+          orderStatus: targetOrderStatus,
+          paymentStatus: targetPaymentStatus,
+          deliveryStatus: targetDeliveryStatus,
+        },
+        reason,
+        req,
+      },
+      tx
+    );
+
+    return {
+      order: updatedOrder,
+      payment: updatedPayment,
+    };
   });
 
-  await logAuditEvent({
-    req,
-    userId: adminUserId,
-    action: "PAYMENT_REFUNDED",
-    entityType: "PAYMENT",
-    entityId: refundedOrder.orderNumber,
-    metadata: {
-      orderId: refundedOrder.id,
-      orderNumber: refundedOrder.orderNumber,
-      amount: refundedOrder.payableAmount,
-    },
-  });
+  // কাস্টমারকে পেমেন্ট ভেরিফাই হওয়ার নোটিফিকেশন পাঠানো
+  await notifyPaymentVerified(verifiedResult.order);
 
-  return formatOrderResponse(refundedOrder, true);
-}
+  // ধাপ ৪: পেমেন্ট ভেরিফাই হওয়ার সাথে সাথেই স্বয়ংক্রিয় ডেলিভারি ইঞ্জিন চালু করা (Part 5)
+  let deliveryOutcome = null;
+  let finalOrderState = verifiedResult.order;
 
-/**
- * ৩. নির্দিষ্ট অর্ডারের পেমেন্ট স্ট্যাটাস ও বিস্তারিত তথ্য চেক করা (GET /api/payments/:orderNumber)
- */
-export async function getPaymentByOrderIdentifier(
-  identifier,
-  currentUser = null
-) {
-  const order = await findOrderWithPayment(identifier);
-  const isAdmin = currentUser?.role === "ADMIN";
+  if (autoTriggerDelivery) {
+    deliveryOutcome = await processOrderDelivery(verifiedResult.order.id, {
+      triggeredBy: adminUser?.email || 'ADMIN_VERIFICATION',
+    });
 
-  return {
-    orderNumber: order.orderNumber,
-    orderStatus: order.orderStatus,
-    payableAmount: order.payableAmount,
-    playerUid: order.playerUid,
-    playerName: order.playerName,
-    payment: order.payment
-      ? {
-          id: order.payment.id,
-          paymentMethod: order.payment.paymentMethod,
-          amount: order.payment.amount,
-          senderNumber: order.payment.senderNumber,
-          transactionReference: order.payment.transactionReference,
-          status: order.payment.status,
-          rejectionReason: order.payment.rejectionReason,
-          submittedAt: order.payment.submittedAt,
-          verifiedAt: order.payment.verifiedAt,
-          ...(isAdmin ? { verifiedBy: order.payment.verifiedBy } : {}),
-        }
-      : null,
-  };
-}
-
-/**
- * ৪. অ্যাডমিন প্যানেলের জন্য সকল পেমেন্ট তালিকা, ফিল্টারিং এবং TrxID সার্চ (GET /api/payments)
- */
-export async function getAllPaymentsForAdmin(query = {}) {
-  const page = Math.max(1, Number(query.page || 1));
-  const limit = Math.min(100, Math.max(1, Number(query.limit || 20)));
-  const skip = (page - 1) * limit;
-
-  const whereClause = {};
-
-  if (query.status) {
-    whereClause.status = query.status;
-  }
-
-  if (query.paymentMethod) {
-    whereClause.paymentMethod = query.paymentMethod;
-  }
-
-  if (query.search) {
-    const cleanSearch = String(query.search).trim();
-    whereClause.OR = [
-      { transactionReference: { contains: cleanSearch, mode: "insensitive" } },
-      { senderNumber: { contains: cleanSearch, mode: "insensitive" } },
-      {
-        order: {
-          orderNumber: { contains: cleanSearch, mode: "insensitive" },
-        },
-      },
-      {
-        order: {
-          playerUid: { contains: cleanSearch, mode: "insensitive" },
-        },
-      },
-    ];
-  }
-
-  const [payments, totalCount] = await Promise.all([
-    prisma.payment.findMany({
-      where: whereClause,
+    finalOrderState = await prisma.order.findUnique({
+      where: { id: verifiedResult.order.id },
       include: {
-        order: {
-          select: {
-            id: true,
-            orderNumber: true,
-            playerUid: true,
-            playerName: true,
-            server: true,
-            payableAmount: true,
-            orderStatus: true,
-            createdAt: true,
-          },
-        },
+        payment: true,
+        delivery: true,
       },
-      orderBy: { updatedAt: "desc" },
-      skip,
-      take: limit,
-    }),
-    prisma.payment.count({ where: whereClause }),
-  ]);
+    });
+  }
 
   return {
-    payments,
-    meta: {
-      page,
-      limit,
-      total: totalCount,
-      totalPages: Math.ceil(totalCount / limit) || 1,
-    },
+    decision: 'VERIFIED',
+    alreadyVerified: false,
+    deliveryTriggered: Boolean(autoTriggerDelivery),
+    deliveryOutcome,
+    order: finalOrderState,
+    payment: finalOrderState.payment,
+    timeline: buildFiveStepTrackingTimeline(finalOrderState),
   };
-}
+};
+
+module.exports = {
+  getPaymentInstructions,
+  submitManualPayment,
+  verifyOrRejectPayment,
+};
