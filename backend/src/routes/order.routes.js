@@ -1,105 +1,89 @@
-import { Router } from "express";
-import {
-  createOrder,
-  getOrderDetails,
-  getMyOrders,
-  getAllOrders,
-  updateOrderStatus,
-} from "../controllers/order.controller.js";
-import {
-  optionalAuth,
-  requireAuth,
-  requireAdmin,
-} from "../middlewares/auth.middleware.js";
-import { orderAndPaymentLimiter } from "../middlewares/rateLimiter.middleware.js";
-import { idempotencyProtection } from "../middlewares/idempotency.middleware.js";
-import { validate } from "../middlewares/validate.middleware.js";
-import {
-  createOrderSchema,
-  orderNumberParamSchema,
-  listOrdersQuerySchema,
-  updateOrderStatusSchema,
-} from "../validators/order.validator.js";
+const express = require('express');
+const router = express.Router();
 
-const router = Router();
+const { optionalAuth } = require('../middlewares/auth.middleware');
+const { idempotencyProtection } = require('../middlewares/idempotency.middleware');
+const {
+  orderCreationLimiter,
+  paymentSubmissionLimiter,
+  trackingRateLimiter,
+} = require('../middlewares/rateLimiter.middleware');
+const {
+  validateOrderCreation,
+  validatePaymentSubmission,
+  validateOrderIdParam,
+} = require('../middlewares/validate.middleware');
+
+const {
+  getPaymentInstructionsHandler,
+  createOrderHandler,
+  submitOrderPaymentHandler,
+  trackOrderPublicHandler,
+  getOrderDetailsHandler,
+  getMyOrdersHandler,
+} = require('../controllers/order.controller');
 
 /**
- * @route   POST /api/orders
- * @desc    নতুন ডায়মন্ড বা মেম্বারশিপ অর্ডার তৈরি করা (Guest এবং Logged-in ইউজার উভয়ের জন্য)
- *          Rate Limiting, Idempotency (ডাবল-ক্লিক সুরক্ষা) এবং Zod Validation যুক্ত
- * @access  Public / Optional Auth
+ * ১. ম্যানুয়াল পেমেন্ট নির্দেশনা (bKash, Nagad, Rocket নাম্বার ও নিয়মাবলি)
+ * GET /api/orders/payment-instructions
+ */
+router.get('/payment-instructions', getPaymentInstructionsHandler);
+
+/**
+ * ২. কাস্টমার বা গেস্টের নিজস্ব অর্ডার হিস্ট্রি লিস্ট
+ * GET /api/orders/my-orders
+ * GET /api/orders
+ */
+router.get('/my-orders', optionalAuth, getMyOrdersHandler);
+router.get('/', optionalAuth, getMyOrdersHandler);
+
+/**
+ * ৩. পাবলিক লাইভ অর্ডার ট্র্যাকিং (মাস্কড Player UID ও ৫-ধাপের টাইমলাইনসহ)
+ * GET /api/orders/track/:orderId
+ */
+router.get(
+  '/track/:orderId',
+  trackingRateLimiter,
+  validateOrderIdParam,
+  trackOrderPublicHandler
+);
+
+/**
+ * ৪. নতুন স্মার্ট অর্ডার তৈরি (রেট লিমিট, ইনপুট ভ্যালিডেশন ও ডুপ্লিকেট অর্ডার ইডেমপোটেন্সি সুরক্ষাসহ)
+ * POST /api/orders
  */
 router.post(
-  "/",
-  orderAndPaymentLimiter,
+  '/',
   optionalAuth,
-  idempotencyProtection({ required: false }),
-  validate({ body: createOrderSchema }),
-  createOrder
+  orderCreationLimiter,
+  validateOrderCreation,
+  idempotencyProtection(),
+  createOrderHandler
 );
 
 /**
- * @route   GET /api/orders/my-orders
- * @desc    লগইন করা ইউজারের নিজস্ব সকল অর্ডারের হিস্ট্রি ও পেজিনেশন
- *          (সতর্কতা: এই রাউটটি অবশ্যই /:orderNumber-এর ওপরে থাকতে হবে)
- * @access  Private (Logged-in Customer/Admin)
+ * ৫. অর্ডারের বিপরীতে ম্যানুয়াল পেমেন্ট (TrxID ও Sender Number) সাবমিশন
+ * POST /api/orders/:orderId/payment
  */
-router.get(
-  "/my-orders",
-  requireAuth,
-  validate({ query: listOrdersQuerySchema }),
-  getMyOrders
-);
-
-/**
- * @route   GET /api/orders/track/:orderNumber
- * @desc    Order Number (যেমন: FFH-20261124-000001) দিয়ে অর্ডারের লাইভ স্ট্যাটাস ও ডেলিভারি ট্র্যাক করা
- * @access  Public / Optional Auth
- */
-router.get(
-  "/track/:orderNumber",
+router.post(
+  '/:orderId/payment',
   optionalAuth,
-  validate({ params: orderNumberParamSchema }),
-  getOrderDetails
+  paymentSubmissionLimiter,
+  validateOrderIdParam,
+  validatePaymentSubmission,
+  idempotencyProtection(),
+  submitOrderPaymentHandler
 );
 
 /**
- * @route   GET /api/orders
- * @desc    অ্যাডমিন প্যানেলের জন্য সব অর্ডারের তালিকা, সার্চ এবং স্ট্যাটাস ফিল্টারিং
- * @access  Private (Admin Only)
+ * ৬. নির্দিষ্ট অর্ডারের বিস্তারিত তথ্য (মালিক বা অ্যাডমিনের জন্য পূর্ণ ভিউ, অন্যদের জন্য মাস্কড ভিউ)
+ * GET /api/orders/:orderId
  */
 router.get(
-  "/",
-  requireAdmin,
-  validate({ query: listOrdersQuerySchema }),
-  getAllOrders
-);
-
-/**
- * @route   GET /api/orders/:orderNumber
- * @desc    নির্দিষ্ট Order Number বা UUID দিয়ে অর্ডারের বিস্তারিত তথ্য দেখা
- * @access  Public / Optional Auth
- */
-router.get(
-  "/:orderNumber",
+  '/:orderId',
   optionalAuth,
-  validate({ params: orderNumberParamSchema }),
-  getOrderDetails
+  validateOrderIdParam,
+  getOrderDetailsHandler
 );
 
-/**
- * @route   PATCH /api/orders/:orderNumber/status
- * @desc    অ্যাডমিনের মাধ্যমে যেকোনো অর্ডারের স্ট্যাটাস ও নোট আপডেট করা
- * @access  Private (Admin Only)
- */
-router.patch(
-  "/:orderNumber/status",
-  requireAdmin,
-  validate({
-    params: orderNumberParamSchema,
-    body: updateOrderStatusSchema,
-  }),
-  updateOrderStatus
-);
-
-export default router;
+module.exports = router;
