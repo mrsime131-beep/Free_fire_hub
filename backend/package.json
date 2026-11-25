@@ -4,13 +4,14 @@
   "description": "Free Fire Diamond Top-Up Smart Order Management & Auto-Delivery Engine Backend",
   "main": "src/server.js",
   "engines": {
-    "node": ">=18.0.0"
+    "node": "22.x"
   },
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "postinstall": "npx prisma generate",
-    "build": "npx prisma generate && npx prisma db push --accept-data-loss",
+    "vercel-build": "npx prisma generate && npx prisma db push --accept-data-loss && node prisma/seed.js",
+    "build": "npx prisma generate && npx prisma db push --accept-data-loss && node prisma/seed.js",
     "db:generate": "npx prisma generate",
     "db:push": "npx prisma db push",
     "db:seed": "node prisma/seed.js",
