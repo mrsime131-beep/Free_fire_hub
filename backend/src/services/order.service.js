@@ -1,641 +1,609 @@
-import { prisma } from "../config/db.js";
-import { env } from "../config/env.js";
-import { ApiError } from "../utils/apiResponse.js";
-import { generateUniqueOrderNumber } from "../utils/orderIdGenerator.js";
-import { verifyPlayerForOrder } from "./player.service.js";
-import { logAuditEvent } from "./audit.service.js";
-import { logger } from "../utils/logger.js";
+const prisma = require('../config/prisma');
+const env = require('../config/env');
+const { AppError } = require('../middlewares/error.middleware');
+const { getClientIp } = require('../middlewares/rateLimiter.middleware');
+const { generateUniqueOrderNumber } = require('../utils/orderIdGenerator');
+const {
+  ORDER_STATUS,
+  PAYMENT_STATUS,
+  DELIVERY_STATUS,
+  buildStatusHistoryPayload,
+} = require('../utils/stateMachine');
+const { sanitizeOrderForPublicTracking } = require('../utils/mask');
+const { createAuditLog } = require('./audit.service');
+const {
+  notifyOrderCreated,
+  notifyPaymentSubmitted,
+  getOrderNotifications,
+} = require('./notification.service');
 
 /**
- * অর্ডার অবজেক্টকে Frontend এবং REST API উভয়ের জন্য স্ট্যান্ডার্ড ফরম্যাটে সাজানোর হেল্পার ফাংশন
+ * ১. ডাটাবেস থেকে প্রোডাক্ট যাচাই এবং সার্ভার-সাইড প্রাইস ক্যালকুলেশন
+ * (ফ্রন্টএন্ড থেকে কেউ দাম কমিয়ে বা পরিবর্তন করে পাঠালে তা সাথে সাথে ব্লক করবে)
  */
-export function formatOrderResponse(order, isAdmin = false) {
-  if (!order) return null;
+const resolveAndValidateProduct = async (productIdentifier, clientSentPrice = null) => {
+  const cleanId = String(productIdentifier || '').trim();
 
-  const totalDiamonds = Array.isArray(order.items)
-    ? order.items.reduce(
-        (sum, item) =>
-          sum +
-          (Number(item.diamondQuantity || 0) + Number(item.bonusDiamonds || 0)) *
-            Number(item.quantity || 1),
-        0
-      )
-    : 0;
-
-  const formattedItems = Array.isArray(order.items)
-    ? order.items.map((item) => {
-        const cleanItem = {
-          id: item.id,
-          productId: item.productId,
-          productName: item.productName,
-          productSku: item.productSku,
-          diamondQuantity: item.diamondQuantity,
-          bonusDiamonds: item.bonusDiamonds,
-          quantity: item.quantity,
-          unitSellingPrice: item.unitSellingPrice,
-          totalPrice: item.totalPrice,
-        };
-
-        if (isAdmin) {
-          cleanItem.unitPurchasePrice = item.unitPurchasePrice;
-        }
-
-        return cleanItem;
-      })
-    : [];
-
-  return {
-    id: order.id,
-    orderNumber: order.orderNumber,
-    orderId: order.orderNumber, // Frontend Compatibility Alias
-    userId: order.userId,
-    guestPhone: order.guestPhone,
-    guestEmail: order.guestEmail,
-    playerUid: order.playerUid,
-    playerName: order.playerName,
-    server: order.server,
-    totalDiamonds,
-    subtotalAmount: order.subtotalAmount,
-    discountAmount: order.discountAmount,
-    payableAmount: order.payableAmount,
-    couponCode: order.couponCode,
-    paymentMethod: order.paymentMethod,
-    paymentStatus: order.paymentStatus,
-    orderStatus: order.orderStatus,
-    status: order.orderStatus, // Frontend Compatibility Alias
-    customerNote: order.customerNote,
-    ...(isAdmin ? { adminNote: order.adminNote } : {}),
-    items: formattedItems,
-    payment: order.payment
-      ? {
-          id: order.payment.id,
-          paymentMethod: order.payment.paymentMethod,
-          amount: order.payment.amount,
-          senderNumber: order.payment.senderNumber,
-          transactionReference: order.payment.transactionReference,
-          status: order.payment.status,
-          rejectionReason: order.payment.rejectionReason,
-          submittedAt: order.payment.submittedAt,
-          verifiedAt: order.payment.verifiedAt,
-        }
-      : null,
-    delivery: order.delivery
-      ? {
-          id: order.delivery.id,
-          status: order.delivery.status,
-          totalDiamonds: order.delivery.totalDiamonds,
-          deliveryReferenceId: order.delivery.deliveryReferenceId,
-          isDemoMode: order.delivery.isDemoMode,
-          attempts: order.delivery.attempts,
-          deliveredAt: order.delivery.deliveredAt,
-          ...(isAdmin ? { errorMessage: order.delivery.errorMessage } : {}),
-        }
-      : null,
-    completedAt: order.completedAt,
-    createdAt: order.createdAt,
-    updatedAt: order.updatedAt,
-  };
-}
-
-/**
- * কুপন কোড যাচাই এবং ডিসকাউন্ট অ্যামাউন্ট হিসাব করার অভ্যন্তরীণ ফাংশন
- */
-async function validateAndCalculateCoupon(couponCode, subtotalAmount, dbClient = prisma) {
-  if (!couponCode) {
-    return { coupon: null, discountAmount: 0 };
-  }
-
-  const cleanCode = String(couponCode).trim().toUpperCase();
-  const coupon = await dbClient.coupon.findUnique({
-    where: { code: cleanCode },
+  const product = await prisma.product.findFirst({
+    where: {
+      OR: [
+        { id: cleanId },
+        { slug: cleanId.toLowerCase() },
+        { sku: cleanId.toUpperCase() },
+      ],
+    },
   });
 
-  if (!coupon || !coupon.isActive) {
-    throw new ApiError(
-      400,
-      `কুপন কোড '${cleanCode}' বৈধ নয় অথবা বর্তমানে নিষ্ক্রিয়।`,
-      null,
-      "INVALID_COUPON"
+  if (!product) {
+    throw new AppError(
+      'সিলেক্ট করা ডায়মন্ড প্যাকেজটি ডাটাবেসে খুঁজে পাওয়া যায়নি।',
+      404,
+      'PRODUCT_NOT_FOUND'
     );
   }
 
-  const now = new Date();
-  if (coupon.startsAt && now < new Date(coupon.startsAt)) {
-    throw new ApiError(
+  if (!product.isActive) {
+    throw new AppError(
+      `দুঃখিত, "${product.name}" প্যাকেজটি বর্তমানে স্টকে নেই বা সাময়িকভাবে বন্ধ রয়েছে।`,
       400,
-      "এই কুপন কোডটির মেয়াদ এখনো শুরু হয়নি।",
-      null,
-      "COUPON_NOT_STARTED"
+      'PRODUCT_INACTIVE'
     );
   }
 
-  if (coupon.expiresAt && now > new Date(coupon.expiresAt)) {
-    throw new ApiError(
-      400,
-      "এই কুপন কোডটির মেয়াদ শেষ হয়ে গেছে।",
-      null,
-      "COUPON_EXPIRED"
+  const unitPrice = Number(product.unitPrice ?? product.price ?? 0);
+  const discountAmount = Number(product.discountAmount ?? 0);
+  const finalPayableAmount = Number(
+    product.finalPayableAmount ?? Math.max(0, unitPrice - discountAmount)
+  );
+  const diamondQuantity = Number(
+    product.diamondQuantity ??
+      Number(product.baseDiamonds || 0) + Number(product.bonusDiamonds || 0)
+  );
+
+  if (finalPayableAmount <= 0 || diamondQuantity <= 0) {
+    throw new AppError(
+      'প্রোডাক্টের মূল্য বা ডায়মন্ড সংখ্যা সঠিক নয়। অনুগ্রহ করে অ্যাডমিনের সাথে যোগাযোগ করুন।',
+      500,
+      'INVALID_PRODUCT_CONFIGURATION'
     );
   }
 
-  if (
-    coupon.usageLimit !== null &&
-    coupon.usageLimit !== undefined &&
-    coupon.usedCount >= coupon.usageLimit
-  ) {
-    throw new ApiError(
-      400,
-      "এই কুপন কোডটির সর্বোচ্চ ব্যবহারের সীমা শেষ হয়ে গেছে।",
-      null,
-      "COUPON_LIMIT_REACHED"
-    );
-  }
-
-  if (subtotalAmount < Number(coupon.minOrderAmount || 0)) {
-    throw new ApiError(
-      400,
-      `এই কুপনটি ব্যবহার করতে কমপক্ষে ৳${coupon.minOrderAmount} টাকার অর্ডার করতে হবে।`,
-      null,
-      "COUPON_MIN_AMOUNT_NOT_MET"
-    );
-  }
-
-  let discountAmount = 0;
-  if (coupon.discountType === "PERCENTAGE") {
-    discountAmount = (subtotalAmount * Number(coupon.discountValue)) / 100;
-    if (
-      coupon.maxDiscountAmount !== null &&
-      coupon.maxDiscountAmount !== undefined &&
-      discountAmount > Number(coupon.maxDiscountAmount)
-    ) {
-      discountAmount = Number(coupon.maxDiscountAmount);
+  // সার্ভার-সাইড প্রাইস ট্যাম্পারিং চেক (Part 3 & Part 14)
+  if (clientSentPrice !== null && clientSentPrice !== undefined) {
+    const numericClientPrice = Number(clientSentPrice);
+    if (Math.abs(numericClientPrice - finalPayableAmount) > 0.01) {
+      throw new AppError(
+        `প্রোডাক্টের মূল্য পরিবর্তন (Price Mismatch) শনাক্ত হয়েছে! প্যাকেজের আসল মূল্য ৳${finalPayableAmount}, কিন্তু পাঠানো হয়েছে ৳${numericClientPrice}।`,
+        400,
+        'PRICE_TAMPERING_DETECTED'
+      );
     }
-  } else {
-    discountAmount = Number(coupon.discountValue);
   }
-
-  discountAmount = Math.min(subtotalAmount, Number(discountAmount.toFixed(2)));
 
   return {
-    coupon,
+    product,
+    unitPrice,
     discountAmount,
+    finalPayableAmount,
+    diamondQuantity,
   };
-}
+};
 
 /**
- * ১. নতুন অর্ডার তৈরি করার মূল সার্ভিস (createNewOrder)
- * - Idempotency ডুপ্লিকেট অর্ডার প্রতিরোধ
- * - Duplicate Transaction ID (TrxID) প্রি-চেক
- * - রিয়েল-টাইম Free Fire Player UID ও Name যাচাই
- * - ডাটাবেস থেকে প্রোডাক্টের আসল দাম ও স্টক যাচাই
- * - Atomic Database Transaction-এ Order, OrderItem, Payment ও Delivery তৈরি
+ * ২. কাস্টমারের জন্য ৫-ধাপের লাইভ অর্ডার ট্র্যাকিং টাইমলাইন তৈরি করা (Part 8)
  */
-export async function createNewOrder(payload, req = null) {
+const buildFiveStepTrackingTimeline = (order) => {
+  const orderStatus = order.orderStatus;
+  const paymentStatus = order.paymentStatus;
+  const deliveryStatus = order.deliveryStatus;
+
+  const isPaymentSubmitted = [
+    PAYMENT_STATUS.SUBMITTED,
+    PAYMENT_STATUS.VERIFYING,
+    PAYMENT_STATUS.VERIFIED,
+    PAYMENT_STATUS.REFUNDED,
+  ].includes(paymentStatus);
+
+  const isPaymentVerified = [
+    PAYMENT_STATUS.VERIFIED,
+    PAYMENT_STATUS.REFUNDED,
+  ].includes(paymentStatus);
+
+  const isDeliveryStarted = [
+    DELIVERY_STATUS.QUEUED,
+    DELIVERY_STATUS.PROCESSING,
+    DELIVERY_STATUS.RETRY_PENDING,
+    DELIVERY_STATUS.COMPLETED,
+  ].includes(deliveryStatus);
+
+  const isCompleted =
+    orderStatus === ORDER_STATUS.COMPLETED &&
+    deliveryStatus === DELIVERY_STATUS.COMPLETED;
+
+  const steps = [
+    {
+      stepNumber: 1,
+      key: 'ORDER_CREATED',
+      title: 'অর্ডার গ্রহণ করা হয়েছে',
+      description: `অর্ডার আইডি ${order.orderNumber} সফলভাবে তৈরি হয়েছে।`,
+      status: 'COMPLETED',
+      timestamp: order.createdAt,
+    },
+    {
+      stepNumber: 2,
+      key: 'PAYMENT_SUBMITTED',
+      title: 'পেমেন্ট তথ্য জমা',
+      description:
+        paymentStatus === PAYMENT_STATUS.REJECTED
+          ? 'প্রদত্ত পেমেন্ট ট্রানজেকশন (TrxID) গ্রহণ করা যায়নি।'
+          : isPaymentSubmitted
+          ? `${order.paymentMethod} পেমেন্ট তথ্য যাচাইয়ের জন্য জমা হয়েছে।`
+          : 'বিকাশ/নগদ/রকেট পেমেন্টের TrxID জমা দেওয়ার অপেক্ষায় রয়েছে।',
+      status:
+        paymentStatus === PAYMENT_STATUS.REJECTED
+          ? 'FAILED'
+          : isPaymentSubmitted
+          ? 'COMPLETED'
+          : orderStatus === ORDER_STATUS.CANCELLED
+          ? 'CANCELLED'
+          : 'CURRENT',
+      timestamp: order.payment?.submittedAt || null,
+    },
+    {
+      stepNumber: 3,
+      key: 'PAYMENT_VERIFIED',
+      title: 'পেমেন্ট যাচাই সম্পন্ন',
+      description: isPaymentVerified
+        ? 'অ্যাডমিন কর্তৃক আপনার পেমেন্ট সফলভাবে ভেরিফাই হয়েছে।'
+        : paymentStatus === PAYMENT_STATUS.REJECTED
+        ? 'পেমেন্ট ভেরিফিকেশন ব্যর্থ হয়েছে।'
+        : 'অ্যাডমিন আপনার TrxID যাচাই করছেন।',
+      status: isPaymentVerified
+        ? 'COMPLETED'
+        : paymentStatus === PAYMENT_STATUS.REJECTED
+        ? 'FAILED'
+        : isPaymentSubmitted
+        ? 'CURRENT'
+        : 'PENDING',
+      timestamp: order.payment?.verifiedAt || null,
+    },
+    {
+      stepNumber: 4,
+      key: 'DELIVERY_PROCESSING',
+      title: 'ডায়মন্ড ডেলিভারি প্রসেসিং',
+      description:
+        deliveryStatus === DELIVERY_STATUS.COMPLETED
+          ? 'সাপ্লায়ার সার্ভার থেকে ডায়মন্ড প্রেরণ সম্পন্ন হয়েছে।'
+          : deliveryStatus === DELIVERY_STATUS.FAILED
+          ? 'স্বয়ংক্রিয় ডেলিভারি বিঘ্নিত হয়েছে, অ্যাডমিন টিম পরীক্ষা করছেন।'
+          : deliveryStatus === DELIVERY_STATUS.RETRY_PENDING
+          ? 'সাপ্লায়ার সার্ভারে পুনরায় ডেলিভারি চেষ্টা (Retry) চলছে।'
+          : isDeliveryStarted
+          ? 'আপনার ফ্রি ফায়ার ইউআইডিতে ডায়মন্ড পাঠানো হচ্ছে...'
+          : 'পেমেন্ট ভেরিফাই হওয়ার পর ডেলিভারি শুরু হবে।',
+      status:
+        deliveryStatus === DELIVERY_STATUS.COMPLETED
+          ? 'COMPLETED'
+          : deliveryStatus === DELIVERY_STATUS.FAILED
+          ? 'FAILED'
+          : isDeliveryStarted || isPaymentVerified
+          ? 'CURRENT'
+          : 'PENDING',
+      timestamp: order.delivery?.updatedAt || null,
+    },
+    {
+      stepNumber: 5,
+      key: 'ORDER_COMPLETED',
+      title: 'ডেলিভারি সম্পন্ন',
+      description: isCompleted
+        ? `${order.diamondQuantity} ডায়মন্ড সফলভাবে আপনার অ্যাকাউন্টে যুক্ত হয়েছে!`
+        : orderStatus === ORDER_STATUS.REFUNDED
+        ? 'অর্ডারটি রিফান্ড করা হয়েছে।'
+        : orderStatus === ORDER_STATUS.CANCELLED
+        ? 'অর্ডারটি বাতিল করা হয়েছে।'
+        : 'ডায়মন্ড ডেলিভারি সম্পন্ন হওয়ার অপেক্ষায়।',
+      status: isCompleted
+        ? 'COMPLETED'
+        : [ORDER_STATUS.FAILED, ORDER_STATUS.CANCELLED, ORDER_STATUS.REFUNDED].includes(
+            orderStatus
+          )
+        ? 'FAILED'
+        : 'PENDING',
+      timestamp: order.completedAt || order.delivery?.completedAt || null,
+    },
+  ];
+
+  return {
+    currentOrderStatus: orderStatus,
+    currentPaymentStatus: paymentStatus,
+    currentDeliveryStatus: deliveryStatus,
+    isTerminalState: [
+      ORDER_STATUS.COMPLETED,
+      ORDER_STATUS.CANCELLED,
+      ORDER_STATUS.REFUNDED,
+    ].includes(orderStatus),
+    steps,
+  };
+};
+
+/**
+ * ৩. নতুন স্মার্ট অর্ডার তৈরি করা (POST /api/orders)
+ * অ্যাটমিক ডাটাবেস ট্রানজেকশনের মাধ্যমে Order, Payment, Delivery, History ও AuditLog তৈরি করে।
+ */
+const createOrder = async ({
+  validatedOrder,
+  user = null,
+  guestId = null,
+  idempotencyKey = null,
+  req = null,
+}) => {
   const {
     playerUid,
-    server = "BD",
-    items,
+    verifiedPlayerName,
+    gameServer,
+    productId,
     paymentMethod,
-    guestPhone,
-    guestEmail,
-    couponCode,
-    customerNote,
-    senderNumber,
+    customerPhone,
+    customerEmail,
     transactionReference,
-  } = payload;
+    senderNumber,
+    clientSentPrice,
+    notes,
+  } = validatedOrder;
 
-  const effectiveIdempotencyKey =
-    req?.idempotencyKey || payload.idempotencyKey || null;
+  // ধাপ ১: ডাটাবেস থেকে প্রোডাক্ট ও আসল দাম যাচাই করা
+  const {
+    product,
+    unitPrice,
+    discountAmount,
+    finalPayableAmount,
+    diamondQuantity,
+  } = await resolveAndValidateProduct(productId, clientSentPrice);
 
-  // ১. Idempotency Key ডাটাবেস চেক: যদি একই কী দিয়ে অর্ডার ইতিমধ্যে তৈরি হয়ে থাকে, তবে সেটিই রিটার্ন করবে
-  if (effectiveIdempotencyKey) {
-    const existingIdempotentOrder = await prisma.order.findUnique({
-      where: { idempotencyKey: effectiveIdempotencyKey },
-      include: {
-        items: true,
-        payment: true,
-        delivery: true,
-      },
-    });
-
-    if (existingIdempotentOrder) {
-      logger.info(
-        `Returning existing database order for idempotencyKey: ${effectiveIdempotencyKey}`,
-        { orderNumber: existingIdempotentOrder.orderNumber },
-        "ORDER_SERVICE"
-      );
-      return formatOrderResponse(existingIdempotentOrder, req?.user?.role === "ADMIN");
-    }
-  }
-
-  // ২. যদি চেকআউটের সময়ই কাস্টমার Transaction ID (TrxID) দিয়ে থাকে, তবে ডুপ্লিকেট TrxID কি না তা শুরুতেই চেক করা
-  const cleanTrxId = transactionReference
-    ? String(transactionReference).trim().toUpperCase()
-    : null;
-
-  if (cleanTrxId) {
-    const duplicatePayment = await prisma.payment.findUnique({
-      where: { transactionReference: cleanTrxId },
+  // ধাপ ২: যদি অর্ডারের সাথেই TrxID পাঠানো হয়ে থাকে, তবে সেটি আগে ব্যবহৃত হয়েছে কি না তা যাচাই করা
+  if (transactionReference) {
+    const existingTrx = await prisma.payment.findUnique({
+      where: { transactionReference },
       select: { id: true },
     });
 
-    if (duplicatePayment) {
-      throw new ApiError(
+    if (existingTrx) {
+      throw new AppError(
+        'এই Transaction ID (TrxID) ইতিমধ্যে অন্য একটি অর্ডারে ব্যবহার করা হয়েছে। অনুগ্রহ করে সঠিক TrxID দিন।',
         409,
-        "এই Transaction ID (TrxID) ইতিমধ্যে অন্য একটি অর্ডারে ব্যবহৃত হয়েছে। অনুগ্রহ করে সঠিক এবং নতুন TrxID দিন।",
-        null,
-        "DUPLICATE_TRANSACTION_ID"
+        'DUPLICATE_TRANSACTION_REFERENCE'
       );
     }
   }
 
-  // ৩. রিয়েল-টাইম Player UID যাচাই করে আসল Player Name (IGN) বের করা
-  const verifiedPlayer = await verifyPlayerForOrder(playerUid, server);
+  const hasImmediatePaymentInfo = Boolean(transactionReference);
+  const initialOrderStatus = hasImmediatePaymentInfo
+    ? ORDER_STATUS.PAYMENT_REVIEW
+    : ORDER_STATUS.PENDING;
+  const initialPaymentStatus = hasImmediatePaymentInfo
+    ? PAYMENT_STATUS.SUBMITTED
+    : PAYMENT_STATUS.UNPAID;
+  const initialDeliveryStatus = DELIVERY_STATUS.NOT_STARTED;
 
-  // ৪. ডাটাবেস থেকে নির্বাচিত প্রোডাক্টগুলোর আসল তথ্য, স্টক ও দাম লোড করা
-  const requestedIdentifiers = items.map((i) => String(i.productId).trim());
+  const clientIp = req ? getClientIp(req) : null;
+  const userAgent =
+    req?.headers?.['user-agent']
+      ? String(req.headers['user-agent']).slice(0, 300)
+      : null;
 
-  const dbProducts = await prisma.product.findMany({
-    where: {
-      OR: [
-        { id: { in: requestedIdentifiers } },
-        { sku: { in: requestedIdentifiers.map((id) => id.toUpperCase()) } },
-        { slug: { in: requestedIdentifiers.map((id) => id.toLowerCase()) } },
-      ],
-    },
-  });
+  // ধাপ ৩: অ্যাটমিক ডাটাবেস ট্রানজেকশন
+  const createdData = await prisma.$transaction(async (tx) => {
+    const orderNumber = await generateUniqueOrderNumber(tx);
 
-  let subtotalAmount = 0;
-  let totalOrderDiamonds = 0;
-  const preparedOrderItems = [];
-
-  for (const requestedItem of items) {
-    const rawId = String(requestedItem.productId).trim();
-    const quantity = Number(requestedItem.quantity || 1);
-
-    const matchedProduct = dbProducts.find(
-      (p) =>
-        p.id === rawId ||
-        p.sku.toUpperCase() === rawId.toUpperCase() ||
-        p.slug.toLowerCase() === rawId.toLowerCase()
-    );
-
-    if (!matchedProduct) {
-      throw new ApiError(
-        404,
-        `নির্বাচিত প্রোডাক্ট ('${rawId}') খুঁজে পাওয়া যায়নি।`,
-        null,
-        "PRODUCT_NOT_FOUND"
-      );
-    }
-
-    if (!matchedProduct.isActive || matchedProduct.availability !== "IN_STOCK") {
-      throw new ApiError(
-        400,
-        `'${matchedProduct.name}' প্যাকেজটি বর্তমানে স্টকে নেই (${matchedProduct.availability})।`,
-        null,
-        "PRODUCT_OUT_OF_STOCK"
-      );
-    }
-
-    const unitSellingPrice = Number(matchedProduct.sellingPrice);
-    const unitPurchasePrice = Number(matchedProduct.purchasePrice);
-    const itemTotalPrice = Number((unitSellingPrice * quantity).toFixed(2));
-    const itemDiamonds =
-      (Number(matchedProduct.diamondQuantity || 0) +
-        Number(matchedProduct.bonusDiamonds || 0)) *
-      quantity;
-
-    subtotalAmount = Number((subtotalAmount + itemTotalPrice).toFixed(2));
-    totalOrderDiamonds += itemDiamonds;
-
-    preparedOrderItems.push({
-      productId: matchedProduct.id,
-      productName: matchedProduct.name,
-      productSku: matchedProduct.sku,
-      diamondQuantity: matchedProduct.diamondQuantity,
-      bonusDiamonds: matchedProduct.bonusDiamonds,
-      quantity,
-      unitPurchasePrice,
-      unitSellingPrice,
-      totalPrice: itemTotalPrice,
-    });
-  }
-
-  // ৫. কুপন কোড থাকলে তার বৈধতা ও ডিসকাউন্ট হিসাব করা
-  const { coupon, discountAmount } = await validateAndCalculateCoupon(
-    couponCode,
-    subtotalAmount
-  );
-
-  const payableAmount = Number(
-    Math.max(0, subtotalAmount - discountAmount).toFixed(2)
-  );
-
-  // কাস্টমার যদি অর্ডারের সাথেই senderNumber ও TrxID সাবমিট করে, তবে স্ট্যাটাস সরাসরি PAYMENT_REVIEW হবে
-  const hasSubmittedPaymentProof = Boolean(cleanTrxId);
-  const initialOrderStatus = hasSubmittedPaymentProof
-    ? "PAYMENT_REVIEW"
-    : "PENDING";
-  const initialPaymentStatus = hasSubmittedPaymentProof
-    ? "UNDER_REVIEW"
-    : "UNPAID";
-
-  const validServers = ["BD", "INDIA", "SINGAPORE", "OTHER"];
-  const resolvedServer = validServers.includes(server) ? server : "BD";
-  const isDemoMode = String(env.DELIVERY_MODE || "DEMO").toUpperCase() !== "LIVE";
-
-  // ৬. Atomic Database Transaction: Order, OrderItems, Payment, Delivery এবং Coupon Usage একসাথে সেভ করা
-  const createdOrder = await prisma.$transaction(async (tx) => {
-    const uniqueOrderNumber = await generateUniqueOrderNumber(tx);
-
-    if (coupon) {
-      await tx.coupon.update({
-        where: { id: coupon.id },
-        data: {
-          usedCount: { increment: 1 },
-        },
-      });
-    }
-
+    // Order তৈরি
     const newOrder = await tx.order.create({
       data: {
-        orderNumber: uniqueOrderNumber,
-        userId: req?.user?.id || null,
-        guestPhone: guestPhone || senderNumber || req?.user?.phone || null,
-        guestEmail: guestEmail || req?.user?.email || null,
-        playerUid: verifiedPlayer.uid,
-        playerName: verifiedPlayer.playerName,
-        server: resolvedServer,
-        subtotalAmount,
+        orderNumber,
+        userId: user?.id || null,
+        guestId: guestId || null,
+        playerUid,
+        verifiedPlayerName,
+        gameServer: gameServer || 'BD',
+        productId: product.id,
+        productName: product.name,
+        diamondQuantity,
+        unitPrice,
         discountAmount,
-        payableAmount,
-        couponCode: coupon ? coupon.code : null,
+        finalPayableAmount,
+        currency: product.currency || 'BDT',
         paymentMethod,
-        paymentStatus: initialPaymentStatus,
+        paymentReference: transactionReference || null,
         orderStatus: initialOrderStatus,
-        idempotencyKey: effectiveIdempotencyKey,
-        customerNote: customerNote || null,
-        items: {
-          create: preparedOrderItems,
-        },
-        payment: {
-          create: {
-            paymentMethod,
-            amount: payableAmount,
-            senderNumber: senderNumber || guestPhone || null,
-            transactionReference: cleanTrxId,
-            status: initialPaymentStatus,
-            submittedAt: hasSubmittedPaymentProof ? new Date() : null,
-          },
-        },
-        delivery: {
-          create: {
-            playerUid: verifiedPlayer.uid,
-            playerName: verifiedPlayer.playerName,
-            server: resolvedServer,
-            totalDiamonds: totalOrderDiamonds,
-            status: "PENDING",
-            isDemoMode,
-          },
-        },
-      },
-      include: {
-        items: true,
-        payment: true,
-        delivery: true,
+        paymentStatus: initialPaymentStatus,
+        deliveryStatus: initialDeliveryStatus,
+        customerPhone: customerPhone || user?.phone || null,
+        customerEmail: customerEmail || user?.email || null,
+        idempotencyKey: idempotencyKey || null,
+        ipAddress: clientIp,
+        userAgent,
+        notes,
       },
     });
 
-    return newOrder;
+    // Payment রেকর্ড তৈরি
+    const newPayment = await tx.payment.create({
+      data: {
+        orderId: newOrder.id,
+        method: paymentMethod,
+        status: initialPaymentStatus,
+        amount: finalPayableAmount,
+        currency: product.currency || 'BDT',
+        senderNumber: senderNumber || customerPhone || null,
+        transactionReference: transactionReference || null,
+        submittedAt: hasImmediatePaymentInfo ? new Date() : null,
+      },
+    });
+
+    // Delivery রেকর্ড প্রস্তুত রাখা (পেমেন্ট ভেরিফাই না হওয়া পর্যন্ত NOT_STARTED অবস্থায় থাকবে)
+    const newDelivery = await tx.delivery.create({
+      data: {
+        orderId: newOrder.id,
+        status: initialDeliveryStatus,
+        deliveryMode: env.DELIVERY_MODE === 'LIVE' ? 'LIVE' : 'DEMO',
+        attemptCount: 0,
+        maxRetries: env.MAX_DELIVERY_RETRIES || 3,
+      },
+    });
+
+    // OrderStatusHistory রেকর্ড তৈরি
+    await tx.orderStatusHistory.create({
+      data: buildStatusHistoryPayload({
+        orderId: newOrder.id,
+        previousOrderStatus: null,
+        newOrderStatus: initialOrderStatus,
+        previousPaymentStatus: null,
+        newPaymentStatus: initialPaymentStatus,
+        previousDeliveryStatus: null,
+        newDeliveryStatus: initialDeliveryStatus,
+        changedBy: user?.email || (guestId ? `GUEST:${guestId}` : 'CUSTOMER'),
+        reason: hasImmediatePaymentInfo
+          ? 'Order created with manual payment transaction reference submitted.'
+          : 'Order created and awaiting payment submission.',
+      }),
+    });
+
+    // AuditLog রেকর্ড তৈরি
+    await createAuditLog(
+      {
+        actor: user,
+        actorEmail: user?.email || customerEmail || 'CUSTOMER',
+        actorRole: user?.role || 'CUSTOMER',
+        action: 'ORDER_CREATED',
+        entityType: 'ORDER',
+        entityId: newOrder.id,
+        orderId: newOrder.id,
+        previousState: null,
+        newState: {
+          orderNumber: newOrder.orderNumber,
+          orderStatus: initialOrderStatus,
+          paymentStatus: initialPaymentStatus,
+          deliveryStatus: initialDeliveryStatus,
+          finalPayableAmount,
+        },
+        req,
+      },
+      tx
+    );
+
+    return {
+      order: {
+        ...newOrder,
+        payment: newPayment,
+        delivery: newDelivery,
+      },
+      payment: newPayment,
+      delivery: newDelivery,
+    };
   });
 
-  // ৭. Audit Log-এ অর্ডার তৈরির রেকর্ড সংরক্ষণ
-  await logAuditEvent({
-    req,
-    userId: req?.user?.id || null,
-    action: "ORDER_CREATED",
-    entityType: "ORDER",
-    entityId: createdOrder.orderNumber,
-    metadata: {
-      orderId: createdOrder.id,
-      orderNumber: createdOrder.orderNumber,
-      playerUid: createdOrder.playerUid,
-      playerName: createdOrder.playerName,
-      payableAmount: createdOrder.payableAmount,
-      paymentMethod: createdOrder.paymentMethod,
-      orderStatus: createdOrder.orderStatus,
-      hasTrxIdAtCheckout: hasSubmittedPaymentProof,
-    },
-  });
+  // ধাপ ৪: নোটিফিকেশন ডিসপ্যাচ করা
+  await notifyOrderCreated(createdData.order);
+  if (hasImmediatePaymentInfo) {
+    await notifyPaymentSubmitted(createdData.order, createdData.payment);
+  }
 
-  logger.info(
-    `New order created: ${createdOrder.orderNumber} for UID ${createdOrder.playerUid} (${createdOrder.playerName}) — ৳${createdOrder.payableAmount}`,
-    null,
-    "ORDER_SERVICE"
-  );
-
-  return formatOrderResponse(createdOrder, req?.user?.role === "ADMIN");
-}
+  return {
+    order: createdData.order,
+    timeline: buildFiveStepTrackingTimeline(createdData.order),
+  };
+};
 
 /**
- * ২. Order Number (যেমন: FFH-20261124-000001) অথবা Order UUID দিয়ে অর্ডারের বিস্তারিত তথ্য বের করা
+ * ৪. পাবলিক অর্ডার ট্র্যাকিং সার্ভিস (GET /api/orders/track/:orderId)
+ * সংবেদনশীল তথ্য (Player UID ও TrxID) মাস্ক করে নিরাপদ ট্র্যাকিং ডেটা রিটার্ন করে।
  */
-export async function getOrderByNumberOrId(identifier, currentUser = null) {
-  const cleanId = String(identifier).trim();
+const trackOrderPublic = async (orderIdentifier) => {
+  const cleanId = String(orderIdentifier || '').trim();
 
   const order = await prisma.order.findFirst({
     where: {
-      OR: [
-        { orderNumber: cleanId.toUpperCase() },
-        { id: cleanId },
-      ],
+      OR: [{ orderNumber: cleanId.toUpperCase() }, { id: cleanId }],
     },
     include: {
-      items: true,
       payment: true,
       delivery: true,
+      statusHistory: {
+        orderBy: { createdAt: 'asc' },
+        select: {
+          id: true,
+          newOrderStatus: true,
+          newPaymentStatus: true,
+          newDeliveryStatus: true,
+          reason: true,
+          createdAt: true,
+        },
+      },
     },
   });
 
   if (!order) {
-    throw new ApiError(
+    throw new AppError(
+      `প্রদত্ত অর্ডার আইডি (${cleanId}) দিয়ে কোনো অর্ডার খুঁজে পাওয়া যায়নি। অনুগ্রহ করে সঠিক Order ID লিখুন।`,
       404,
-      `অর্ডার '${cleanId}' খুঁজে পাওয়া যায়নি। অনুগ্রহ করে সঠিক Order ID দিন।`,
-      null,
-      "ORDER_NOT_FOUND"
+      'ORDER_NOT_FOUND'
     );
   }
 
-  const isAdmin = currentUser?.role === "ADMIN";
-  return formatOrderResponse(order, isAdmin);
-}
-
-/**
- * ৩. লগইন করা ইউজারের নিজস্ব অর্ডার হিস্ট্রি বের করা (GET /api/orders/my-orders)
- */
-export async function getUserOrders(userId, query = {}) {
-  const page = Number(query.page || 1);
-  const limit = Number(query.limit || 20);
-  const skip = (page - 1) * limit;
-
-  const whereClause = { userId };
-
-  if (query.status) {
-    whereClause.orderStatus = query.status;
-  }
-
-  if (query.paymentStatus) {
-    whereClause.paymentStatus = query.paymentStatus;
-  }
-
-  const [orders, totalCount] = await Promise.all([
-    prisma.order.findMany({
-      where: whereClause,
-      include: {
-        items: true,
-        payment: true,
-        delivery: true,
-      },
-      orderBy: { createdAt: "desc" },
-      skip,
-      take: limit,
-    }),
-    prisma.order.count({ where: whereClause }),
-  ]);
+  const publicOrderView = sanitizeOrderForPublicTracking(order);
+  const timeline = buildFiveStepTrackingTimeline(order);
+  const notifications = await getOrderNotifications(order.id);
 
   return {
-    orders: orders.map((o) => formatOrderResponse(o, false)),
-    meta: {
-      page,
-      limit,
-      total: totalCount,
-      totalPages: Math.ceil(totalCount / limit) || 1,
-    },
+    order: publicOrderView,
+    timeline,
+    statusHistory: order.statusHistory,
+    notifications,
   };
-}
+};
 
 /**
- * ৪. অ্যাডমিন প্যানেলের জন্য সকল অর্ডার ফিল্টার ও পেজিনেশনসহ বের করা (GET /api/orders)
+ * ৫. নির্দিষ্ট অর্ডারের বিস্তারিত তথ্য (GET /api/orders/:orderId)
+ * অর্ডারের প্রকৃত মালিক বা অ্যাডমিন হলে সম্পূর্ণ তথ্য দেখাবে, অন্যথায় মাস্কড পাবলিক ভিউ দেখাবে।
  */
-export async function getAllOrdersForAdmin(query = {}) {
-  const page = Number(query.page || 1);
-  const limit = Number(query.limit || 20);
-  const skip = (page - 1) * limit;
+const getOrderByIdentifier = async ({
+  orderIdentifier,
+  user = null,
+  guestId = null,
+}) => {
+  const cleanId = String(orderIdentifier || '').trim();
 
-  const whereClause = {};
-
-  if (query.status) {
-    whereClause.orderStatus = query.status;
-  }
-
-  if (query.paymentStatus) {
-    whereClause.paymentStatus = query.paymentStatus;
-  }
-
-  if (query.playerUid) {
-    whereClause.playerUid = String(query.playerUid).trim();
-  }
-
-  if (query.search) {
-    const cleanSearch = String(query.search).trim();
-    whereClause.OR = [
-      { orderNumber: { contains: cleanSearch, mode: "insensitive" } },
-      { playerUid: { contains: cleanSearch, mode: "insensitive" } },
-      { playerName: { contains: cleanSearch, mode: "insensitive" } },
-      { guestPhone: { contains: cleanSearch, mode: "insensitive" } },
-      {
-        payment: {
-          transactionReference: { contains: cleanSearch, mode: "insensitive" },
-        },
-      },
-    ];
-  }
-
-  const [orders, totalCount] = await Promise.all([
-    prisma.order.findMany({
-      where: whereClause,
-      include: {
-        items: true,
-        payment: true,
-        delivery: true,
-      },
-      orderBy: { createdAt: "desc" },
-      skip,
-      take: limit,
-    }),
-    prisma.order.count({ where: whereClause }),
-  ]);
-
-  return {
-    orders: orders.map((o) => formatOrderResponse(o, true)),
-    meta: {
-      page,
-      limit,
-      total: totalCount,
-      totalPages: Math.ceil(totalCount / limit) || 1,
-    },
-  };
-}
-
-/**
- * ৫. অ্যাডমিনের মাধ্যমে অর্ডারের স্ট্যাটাস ম্যানুয়ালি আপডেট করা (PATCH /api/orders/:orderNumber/status)
- */
-export async function updateOrderStatusByAdmin(
-  identifier,
-  { orderStatus, adminNote },
-  req = null
-) {
-  const cleanId = String(identifier).trim();
-
-  const existingOrder = await prisma.order.findFirst({
+  const order = await prisma.order.findFirst({
     where: {
-      OR: [{ orderNumber: cleanId.toUpperCase() }, { id: cleanId }],
+      OR: [{ id: cleanId }, { orderNumber: cleanId.toUpperCase() }],
     },
-  });
-
-  if (!existingOrder) {
-    throw new ApiError(
-      404,
-      `অর্ডার '${cleanId}' খুঁজে পাওয়া যায়নি।`,
-      null,
-      "ORDER_NOT_FOUND"
-    );
-  }
-
-  const updateData = {
-    orderStatus,
-  };
-
-  if (adminNote !== undefined) {
-    updateData.adminNote = adminNote;
-  }
-
-  if (orderStatus === "COMPLETED" && !existingOrder.completedAt) {
-    updateData.completedAt = new Date();
-  }
-
-  const updatedOrder = await prisma.order.update({
-    where: { id: existingOrder.id },
-    data: updateData,
     include: {
-      items: true,
       payment: true,
       delivery: true,
+      statusHistory: {
+        orderBy: { createdAt: 'desc' },
+      },
     },
   });
 
-  await logAuditEvent({
-    req,
-    action: "ORDER_STATUS_UPDATED",
-    entityType: "ORDER",
-    entityId: updatedOrder.orderNumber,
-    metadata: {
-      previousStatus: existingOrder.orderStatus,
-      newStatus: updatedOrder.orderStatus,
-      adminNote: adminNote || null,
-    },
-  });
+  if (!order) {
+    throw new AppError('অর্ডারটি খুঁজে পাওয়া যায়নি।', 404, 'ORDER_NOT_FOUND');
+  }
 
-  return formatOrderResponse(updatedOrder, true);
-}
+  const isAdmin =
+    user && ['ADMIN', 'SUPER_ADMIN'].includes(String(user.role).toUpperCase());
+  const isOwnerUser = Boolean(user && order.userId && order.userId === user.id);
+  const isOwnerGuest = Boolean(
+    guestId && order.guestId && order.guestId === guestId
+  );
+
+  const timeline = buildFiveStepTrackingTimeline(order);
+  const notifications = await getOrderNotifications(order.id);
+
+  if (isAdmin || isOwnerUser || isOwnerGuest) {
+    return {
+      isFullAccess: true,
+      order,
+      timeline,
+      notifications,
+    };
+  }
+
+  // আনঅথরাইজড ভিজিটরের ক্ষেত্রে সংবেদনশীল ডেটা মাস্ক করে দেখানো হবে
+  return {
+    isFullAccess: false,
+    order: sanitizeOrderForPublicTracking(order),
+    timeline,
+    notifications,
+  };
+};
+
+/**
+ * ৬. কাস্টমার বা গেস্ট ইউজারের নিজস্ব অর্ডার হিস্ট্রি লিস্ট (GET /api/orders/my-orders)
+ */
+const getCustomerOrders = async ({
+  user = null,
+  guestId = null,
+  playerUid = null,
+  page = 1,
+  limit = 15,
+}) => {
+  const safePage = Math.max(1, Number(page) || 1);
+  const safeLimit = Math.min(50, Math.max(1, Number(limit) || 15));
+  const skip = (safePage - 1) * safeLimit;
+
+  const orConditions = [];
+
+  if (user?.id) {
+    orConditions.push({ userId: user.id });
+  }
+
+  if (guestId) {
+    orConditions.push({ guestId: String(guestId).trim() });
+  }
+
+  if (playerUid && /^\d{5,15}$/.test(String(playerUid).trim())) {
+    orConditions.push({ playerUid: String(playerUid).trim() });
+  }
+
+  if (orConditions.length === 0) {
+    return {
+      orders: [],
+      pagination: {
+        page: safePage,
+        limit: safeLimit,
+        totalCount: 0,
+        totalPages: 1,
+      },
+    };
+  }
+
+  const where = { OR: orConditions };
+
+  const [orders, totalCount] = await Promise.all([
+    prisma.order.findMany({
+      where,
+      include: {
+        payment: {
+          select: {
+            method: true,
+            status: true,
+            transactionReference: true,
+            submittedAt: true,
+            verifiedAt: true,
+          },
+        },
+        delivery: {
+          select: {
+            status: true,
+            deliveryMode: true,
+            deliveryReference: true,
+            completedAt: true,
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: safeLimit,
+    }),
+    prisma.order.count({ where }),
+  ]);
+
+  return {
+    orders,
+    pagination: {
+      page: safePage,
+      limit: safeLimit,
+      totalCount,
+      totalPages: Math.ceil(totalCount / safeLimit) || 1,
+    },
+  };
+};
+
+module.exports = {
+  resolveAndValidateProduct,
+  buildFiveStepTrackingTimeline,
+  createOrder,
+  trackOrderPublic,
+  getOrderByIdentifier,
+  getCustomerOrders,
+};
